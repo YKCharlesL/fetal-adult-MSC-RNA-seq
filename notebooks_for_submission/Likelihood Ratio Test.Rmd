@@ -1,0 +1,952 @@
+---
+title: "Differential Expression: Likelihood Ratio Test Model"
+output: html_notebook
+---
+
+# Setup Environment
+```{r setup, error = FALSE, warning = FALSE}
+#Load dependencies
+library(renv)
+library(ggplot2)
+library(org.Hs.eg.db)
+library(ComplexHeatmap)
+library(EnhancedVolcano)
+library(tidyverse)
+library(gdata)
+library(ashr)
+library(openxlsx)
+library(gprofiler2)
+library(circlize)
+library(egg)
+library(biomaRt)
+library(here)
+library(DESeq2)
+
+exportplots <- function(x, y, w, h){
+  as.character(y)
+  png(filename = here::here("output", paste0(y, ".png")), width = w, height = h, units = "in", res = 600)
+  print(x)
+  dev.off()
+}
+
+
+```
+
+#Load in Data + Meta
+```{r}
+# Load fetal MSC data
+f.counts <- read.csv(here::here("data", "fMSC_norm_counts.csv"), row.names = 1)
+f.meta   <- read.csv(here::here("data", "fMSC_meta.csv"), row.names = 1)
+
+# Load adult MSC data
+a.counts <- read.csv(here::here("data", "aMSC_norm_counts.csv"), row.names = 1)
+a.meta   <- read.csv(here::here("data", "aMSC_meta.csv"), row.names = 1)
+
+#Create data list and meta list to hold both fetal and adult data
+counts = list(f.counts, a.counts)
+names(counts) = c("fMSC","aMSC")
+
+meta = list(f.meta, a.meta)
+names(meta) = c("fMSC","aMSC")
+
+#Correct levels in meta file
+meta[[1]]$Time <- factor(meta[[1]]$Time, levels = c("D0", "D1", "D2", "D3", "D4", "D10", "D17"))
+meta[[2]]$Time <- factor(meta[[2]]$Time, levels = c("D0", "D1", "D2", "D3", "D4", "D10", "D17"))
+```
+
+#Filter for Protein Coding Genes
+```{r}
+mart <- useEnsembl(
+  biomart = "genes",
+  dataset = "hsapiens_gene_ensembl",
+  mirror = "useast"          # safer for publication
+)
+coding.counts = list()
+
+for(i in 1:length(counts)){
+
+  genes <- rownames(counts[[i]])
+  annot <- getBM(
+    attributes = c("ensembl_gene_id", "gene_biotype"),
+    filters = "ensembl_gene_id",
+    values = genes,
+    mart = mart
+    )
+  
+  # Keep protein-coding genes
+  protein_coding_genes <- annot$ensembl_gene_id[annot$gene_biotype == "protein_coding"]
+  coding.counts[[i]] <- counts[[i]][rownames(counts[[i]]) %in% protein_coding_genes, ]
+}
+```
+
+#Generation of the Likelihood Ratio Test Model in DESEQ2
+```{r}
+LRT = list()
+LRT.res = list()
+
+for(i in 1:length(coding.counts)){
+  #Create deseq dataset
+  x = DESeqDataSetFromMatrix(countData = round(coding.counts[[i]]),
+                                colData = meta[[i]],
+                                design = ~ Donor + Time + Condition + Time:Condition)
+  
+  #prefilter for genes with less than 10 coding.counts in 3 or more samples
+  keep = rowSums(counts(x) >= 10) >= 3
+  x = x[keep,]
+  
+  #Construct the LRT model 
+  x <- DESeq(x, test="LRT", reduced = ~ Donor + Time + Condition)
+  x.res <- results(x)
+  x.res$symbol <- mapIds(org.Hs.eg.db, keys = rownames(x.res), keytype = "ENSEMBL", column = "SYMBOL")
+  x.res$EnsemblID <- rownames(x.res)
+  
+  #Output results to the pre-initialized lists
+  LRT[[i]] = x
+  LRT.res[[i]] = x.res
+}
+
+#Export LRT.res as xls for accessibility 
+for(i in 1:length(LRT.res)){
+  if (i == 1) {
+    out_file <- here::here("output", "fMSC.LRT.res.tsv")
+    write.table(as.data.frame(LRT.res[[i]]),
+              file = out_file,
+              sep = "\t",
+              row.names = FALSE)
+    message("Saved file: ", out_file)
+    }
+  else{
+    out_file <- here::here("output", "aMSC.LRT.res.tsv")
+    write.table(as.data.frame(LRT.res[[i]]),
+              file = out_file,
+              sep = "\t",
+              row.names = FALSE)
+    message("Saved file: ", out_file)
+    }
+}
+```
+
+#Plot PCA colouring Donor Differences Fig 2a
+```{r}
+#Generate transformed values from dds_F object for PCA 
+vsd_F <- vst(LRT[[1]], blind = FALSE)
+
+pcaData <- plotPCA(vsd_F, intgroup = c("Donor"),returnData=TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+p1 <- ggplot(pcaData, aes(PC1, PC2, color=Donor)) +
+  geom_point(size=2) +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) + 
+  coord_fixed()+
+  theme_bw()+
+  theme(
+    aspect.ratio = 1,
+    panel.grid.major = element_blank(),  # remove major grid
+    panel.grid.minor = element_blank(),  # remove minor grid
+    legend.position = "bottom",
+    legend.text = element_text(size = 12),
+    legend.title = element_text(size = 14))+  
+  ggtitle("Donors") +
+      xlim(-30, 30) + 
+  ylim(-30, 30) +
+  guides(color = guide_legend(nrow = 1, byrow = TRUE))
+
+p1
+```
+
+#Plot PCA describing Condition Differences Fig 2b
+```{r}
+pcaData <- plotPCA(vsd_F, intgroup = c("Condition"),returnData=TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+
+
+p2 <- ggplot(pcaData, aes(PC1, PC2, color=Condition)) +
+  geom_point(size=2) +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) + 
+  coord_fixed()+
+  theme_bw()+
+  theme(
+    aspect.ratio = 1,
+    panel.grid.major = element_blank(),  # remove major grid
+    panel.grid.minor = element_blank(),  # remove minor grid
+    legend.position = "bottom",
+    legend.text = element_text(size = 12),
+    legend.title = element_text(size = 14))+  
+  ggtitle("Condition") +
+        xlim(-30, 30) + 
+  ylim(-30, 30) +
+  guides(color = guide_legend(nrow = 1, byrow = TRUE))
+
+p2
+```
+
+#Plot PCA showing Time differences but only for OD Fig 2c
+```{r}
+pcaData <- plotPCA(vsd_F, intgroup = c("Time"),returnData=TRUE)
+pcaData <- pcaData[-(which(rownames(pcaData) %in% rownames(f.meta[which(f.meta$Condition == "CTRL"),]))),]
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+p3 <- ggplot(pcaData, aes(PC1, PC2, color = Time)) +
+  geom_point(size = 2) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) + 
+  coord_fixed() +
+  theme_bw() +
+  theme(
+    aspect.ratio = 1,
+    panel.grid.major = element_blank(),  # remove major grid
+    panel.grid.minor = element_blank(),  # remove minor grid
+    legend.position = "bottom"
+  ) +
+  ggtitle("OD coloured by Time") +
+  scale_color_manual(
+    values = c(
+      "D17" = "red",
+      "D10" = "orange",
+      "D4"  = "gray29",
+      "D3"  = "gray44",
+      "D2"  = "gray59",
+      "D1"  = "gray74",
+      "D0"  = "gray89"
+    )
+  ) +
+        xlim(-30, 30) + 
+  ylim(-30, 30) +
+  guides(color = guide_legend(nrow = 1, byrow = TRUE))
+
+p3
+```
+
+#Plot PCA showing Time differences but only for CTRL Fig 2d
+```{r}
+pcaData <- plotPCA(vsd_F, intgroup = c("Time"),returnData=TRUE)
+pcaData <- pcaData[(which(rownames(pcaData) %in% rownames(f.meta[which(f.meta$Condition == "CTRL"),]))),]
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+p4 <- ggplot(pcaData, aes(PC1, PC2, color=Time)) +
+  geom_point(size=2) +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) + 
+  coord_fixed()+
+  theme_bw()+
+  theme(
+    aspect.ratio = 1,
+    panel.grid.major = element_blank(),  # remove major grid
+    panel.grid.minor = element_blank(),  # remove minor grid
+    legend.position = "bottom",
+    legend.text = element_text(size = 12),
+    legend.title = element_text(size = 14))+  
+  ggtitle("CTRL coloured by Time")+
+  scale_color_manual(values = c("D17" = "red", "D10" = "orange", "D4" = "gray29", "D3" = "gray44",
+                           "D2" = "gray59", "D1" = "gray74", "D0" = "gray89"))+
+        xlim(-30, 30) + 
+  ylim(-30, 30) +
+  guides(color = guide_legend(nrow = 1, byrow = TRUE))
+
+p4
+
+exportplots(x = p1, y = "fMSC Donor PCA", h = 4, w=8)
+exportplots(x = p2, y = "fMSC Condition PCA", h = 4, w=8)
+exportplots(x = p3, y = "fMSC OD PCA", h = 4, w=8)
+exportplots(x = p4, y = "fMSC CTRL PCA", h = 4, w=8)
+
+exportplots(x = ggarrange(p1,p2,p3,p4, ncol = 4), y = "fMSC PCA", h = 4, w=14)  
+```
+
+#Plot PCA colouring Donor Differences (2e)
+```{r}
+#Generate transformed values from dds_F object for PCA 
+vsd_A <- vst(LRT[[2]], blind = FALSE)
+
+pcaData <- plotPCA(vsd_A, intgroup = c("Donor"),returnData=TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+p1 <- ggplot(pcaData, aes(PC1, PC2, color=Donor)) +
+  geom_point(size=2) +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) + 
+  coord_fixed()+
+  theme_bw()+
+  theme(
+    aspect.ratio = 1,
+    panel.grid.major = element_blank(),  # remove major grid
+    panel.grid.minor = element_blank(),  # remove minor grid
+    legend.position = "bottom",
+    legend.text = element_text(size = 12),
+    legend.title = element_text(size = 14))+  
+  ggtitle("Donors") +
+  xlim(-30, 38) + 
+  ylim(-25, 25) +
+  guides(color = guide_legend(nrow = 1, byrow = TRUE))
+
+p1
+```
+
+#Plot PCA describing Condition Differences (2f)
+```{r}
+pcaData <- plotPCA(vsd_A, intgroup = c("Condition"),returnData=TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+
+p2 <- ggplot(pcaData, aes(PC1, PC2, color=Condition)) +
+  geom_point(size=2) +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) + 
+  coord_fixed()+
+  theme_bw()+
+  theme(
+    aspect.ratio = 1,
+    panel.grid.major = element_blank(),  # remove major grid
+    panel.grid.minor = element_blank(),  # remove minor grid
+    legend.position = "bottom",
+    legend.text = element_text(size = 12),
+    legend.title = element_text(size = 14))+  
+  ggtitle("Condition") +
+    xlim(-30, 38) + 
+  ylim(-25, 25) +
+  guides(color = guide_legend(nrow = 1, byrow = TRUE))
+
+p2
+```
+
+#Plot PCA showing Time differences but only for OD (2g)
+```{r}
+pcaData <- plotPCA(vsd_A, intgroup = c("Time"),returnData=TRUE)
+pcaData <- pcaData[-(which(rownames(pcaData) %in% rownames(a.meta[which(a.meta$Condition == "CTRL"),]))),]
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+p3 <- ggplot(pcaData, aes(PC1, PC2, color = Time)) +
+  geom_point(size = 2) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) + 
+  coord_fixed() +
+  theme_bw() +
+  theme(
+    aspect.ratio = 1,
+    panel.grid.major = element_blank(),  # remove major grid
+    panel.grid.minor = element_blank(),  # remove minor grid
+    legend.position = "bottom"
+  ) +
+  ggtitle("OD coloured by Time") +
+  scale_color_manual(
+    values = c(
+      "D17" = "red",
+      "D10" = "orange",
+      "D4"  = "gray29",
+      "D3"  = "gray44",
+      "D2"  = "gray59",
+      "D1"  = "gray74",
+      "D0"  = "gray89"
+    ))+
+    xlim(-30, 38) + 
+  ylim(-25, 25) +
+  guides(color = guide_legend(nrow = 1, byrow = TRUE))
+
+p3
+```
+
+#Plot PCA showing Time differences but only for CTRL (2h)
+```{r}
+pcaData <- plotPCA(vsd_A, intgroup = c("Time"),returnData=TRUE)
+pcaData <- pcaData[(which(rownames(pcaData) %in% rownames(a.meta[which(a.meta$Condition == "CTRL"),]))),]
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+p4 <- ggplot(pcaData, aes(PC1, PC2, color=Time)) +
+  geom_point(size=2) +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) + 
+  coord_fixed()+
+  theme_bw()+
+  theme(
+    aspect.ratio = 1,
+    panel.grid.major = element_blank(),  # remove major grid
+    panel.grid.minor = element_blank(),  # remove minor grid
+    legend.position = "bottom",
+    legend.text = element_text(size = 12),
+    legend.title = element_text(size = 14))+  
+  ggtitle("CTRL coloured by Time")+
+  scale_color_manual(values = c("D17" = "red", "D10" = "orange", "D4" = "gray29", "D3" = "gray44",
+                           "D2" = "gray59", "D1" = "gray74", "D0" = "gray89"))+
+    xlim(-30, 38) + 
+  ylim(-25, 25) +
+  guides(color = guide_legend(nrow = 1, byrow = TRUE))
+
+p4
+
+exportplots(x = p1, y = "aMSC Donor PCA", h = 4, w=8)
+exportplots(x = p2, y = "aMSC Condition PCA", h = 4, w=8)
+exportplots(x = p3, y = "aMSC OD PCA", h = 4, w=8)
+exportplots(x = p4, y = "aMSC CTRL PCA", h = 4, w=8)
+
+exportplots(x = ggarrange(p1,p2,p3,p4, ncol = 4), y = "aMSC PCA", h = 4, w=14)  
+```
+
+#Scaled heatmaps from LRT DEGs (Fig 3)
+```{r}
+#Extract the Ensemble ID of significantly differential expressed according to the LRT model
+sig.LRT = list()
+for (i in 1:2){
+  x = LRT.res[[i]][which(LRT.res[[i]]$padj < 0.01),]
+  sig.LRT[[i]] = rownames(x)
+}
+
+#Generate better labels for visualization based off meta
+for (i in 1:2) {
+  meta[[i]]$label = paste(meta[[i]]$Donor,meta[[i]]$Condition, meta[[i]]$Time,sep="_")
+}
+
+#Generate a scaled matrix with LRT significant genes and transformed counts for plotting heatmaps
+hmap_mat = list()
+for (i in 1:2){
+  x = varianceStabilizingTransformation(LRT[[i]], blind = FALSE) #Transform counts
+  mat = assay(x)
+  sig.mat = mat[which(rownames(mat) %in% sig.LRT[[i]]),] #Filter for LRT significant counts
+  scaled.sig.mat = t(apply(sig.mat,1,scale)) #Scale the counts for plotting on heatmap
+  colnames(scaled.sig.mat) = meta[[i]]$label #Change labels to labels column in meta
+  clean.scaled.sig.mat = scaled.sig.mat[,duplicated(scaled.sig.mat[1,]) == FALSE] #Clean mat for duplicated baseline
+  rownames(clean.scaled.sig.mat) = mapIds(org.Hs.eg.db, keys = rownames(clean.scaled.sig.mat), keytype = "ENSEMBL", column = "SYMBOL") #Replace with Gene Symbols for a more descriptive Heatmap
+
+  hmap_mat[[i]] = clean.scaled.sig.mat
+}
+```
+
+#Plot fMSC Heatmap (3b)
+```{r}
+mean.fetal.donor = matrix(NA, nrow = nrow(hmap_mat[[1]]), ncol = 13)
+rownames(mean.fetal.donor) = rownames(hmap_mat[[1]])
+
+for(i in 1:13){ #Loop to obtain the average expression for each gene between donors
+  x = rowMeans(hmap_mat[[1]][,seq(i,52,13)])
+  mean.fetal.donor[,i] = x
+}
+
+colnames(mean.fetal.donor) = sub(".*?_", "",colnames(hmap_mat[[1]][,1:13])) #Generate Labels for new matrix
+mean.fetal.donor = mean.fetal.donor[,c(1, seq(2,13,2), seq(3,13,2))] #Reorder Columns to separate time and condition
+
+Time_labels = c("D0", "D1","D2","D3","D4","D10", "D17","D1","D2","D3","D4","D10", "D17")
+Time_labels = factor(Time_labels, levels = c("D0", "D1", "D2", "D3", "D4", "D10", "D17"))
+
+ha = HeatmapAnnotation(Time = Time_labels, 
+                       Condition = c("Baseline",                                                               "OD","OD","OD","OD","OD","OD","CTRL","CTRL","CTRL","CTRL","CTRL","CTRL"),
+                       col = list(Time = c("D17" = "gray1", "D10" = "gray15", "D4" = "gray29", "D3" = "gray44",
+                           "D2" = "gray59", "D1" = "gray74", "D0" = "gray89"),
+                                  Condition = c("Baseline" = "green", "OD" = "magenta", "CTRL" = "lightblue" )),
+                       annotation_name_side = "left"
+                       )
+
+#Correct the name of baseline to just D0
+colnames(mean.fetal.donor)[1] <- "D0"
+
+set.seed(123)
+fMSC_LRT_Heatmap = Heatmap(mean.fetal.donor,
+                     show_column_dend = FALSE,
+                     show_row_names = F,
+                     show_row_dend = FALSE,
+                     cluster_columns = FALSE,
+                     top_annotation = ha,
+                     name = "Z-Score",
+                     column_title = "fMSC LRT DEGs",
+                     column_title_gp = gpar(fontsize = 25, fontface = "bold"),
+                     width = unit(10,"cm"),
+                     row_km = 4,
+                     row_gap = unit(2,"mm")
+                     )
+fMSC_LRT_Heatmap = draw(fMSC_LRT_Heatmap, heatmap_legend_side = "left", annotation_legend_side = "left")
+exportplots(x = fMSC_LRT_Heatmap, y = "fMSC_LRT_Heatmap", h = 4, w=14)  
+```
+
+#GO Enrichment fetal clusters from LRT heatmap (3b)
+```{r}
+#Extract each cluster and run enrichment.
+fMSC.clusters = row_order(fMSC_LRT_Heatmap) #Extract clusters
+
+f.clu.gene <- lapply(names(fMSC.clusters), function(i){
+
+  symbols <- rownames(mean.fetal.donor)[fMSC.clusters[[i]]]
+
+  out <- data.frame(
+    Symbol  = symbols,
+    Cluster = paste0("cluster", i),
+    stringsAsFactors = FALSE
+  )
+  out
+})
+
+
+write.xlsx(f.clu.gene,"/output/Fetal.LRT.ClusterGenes.xlsx", colNames = TRUE) #Export Cluster Genes
+
+f.clu.gsea.GO = list()
+for(i in 1:length(f.clu.gene)){
+  out.go <- gost(query = f.clu.gene[[i]][,1],
+                 organism = "hsapiens", ordered_query = FALSE, 
+                 multi_query = FALSE, significant = TRUE, exclude_iea = FALSE, 
+                 measure_underrepresentation = FALSE, evcodes = FALSE, 
+                 user_threshold = 0.05, correction_method = "g_SCS", 
+                 domain_scope = "annotated", custom_bg = NULL, 
+                 numeric_ns = "", sources = NULL, as_short_link = FALSE, highlight = TRUE)
+  f.clu.gsea.GO[[i]] <- out.go$result
+}
+
+a<-c() #Create a variable of cluster names the f.clu.gsea.GO indexes represent
+for(i in 1:length(f.clu.gene)){
+  new <- f.clu.gene[[i]][1,2]
+  a <- c(a, new)
+}
+
+names(f.clu.gsea.GO) <- a #Assign meaningful element names to f.clu.gsea.GO
+write.xlsx(f.clu.gsea.GO,"/output/Fetal.LRT.GO.xlsx", colNames = TRUE)
+```
+
+#Plot aMSC LRT-DEG Heatmap (3c)
+```{r}
+mean.adult.donor = matrix(NA, nrow = nrow(hmap_mat[[1]]), ncol = 13)
+rownames(mean.adult.donor) = rownames(hmap_mat[[1]])
+
+for(i in 1:13){ #Loop to obtain the average expression for each gene between donors
+  x = rowMeans(hmap_mat[[1]][,seq(i,52,13)])
+  mean.adult.donor[,i] = x
+}
+
+colnames(mean.adult.donor) = sub(".*?_", "",colnames(hmap_mat[[1]][,1:13])) #Generate Labels for new matrix
+mean.adult.donor = mean.adult.donor[,c(1, seq(2,13,2), seq(3,13,2))] #Reorder Columns to separate time and condition
+
+Time_labels = c("D0", "D1","D2","D3","D4","D10", "D17","D1","D2","D3","D4","D10", "D17")
+Time_labels = factor(Time_labels, levels = c("D0", "D1", "D2", "D3", "D4", "D10", "D17"))
+
+ha = HeatmapAnnotation(Time = Time_labels, 
+                       Condition = c("Baseline",                                                               "OD","OD","OD","OD","OD","OD","CTRL","CTRL","CTRL","CTRL","CTRL","CTRL"),
+                       col = list(Time = c("D17" = "gray1", "D10" = "gray15", "D4" = "gray29", "D3" = "gray44",
+                           "D2" = "gray59", "D1" = "gray74", "D0" = "gray89"),
+                                  Condition = c("Baseline" = "green", "OD" = "magenta", "CTRL" = "lightblue" )),
+                       annotation_name_side = "left"
+                       )
+
+#Correct the name of baseline to just D0
+colnames(mean.adult.donor)[1] <- "D0"
+
+set.seed(123)
+aMSC_LRT_Heatmap = Heatmap(mean.adult.donor,
+                     show_column_dend = FALSE,
+                     show_row_names = F,
+                     show_row_dend = FALSE,
+                     cluster_columns = FALSE,
+                     top_annotation = ha,
+                     name = "Z-Score",
+                     column_title = "aMSC LRT DEGs",
+                     column_title_gp = gpar(fontsize = 25, fontface = "bold"),
+                     width = unit(10,"cm"),
+                     row_km = 4, #Determined based off manual inspection
+                     row_gap = unit(2,"mm")
+                     )
+aMSC_LRT_Heatmap = draw(aMSC_LRT_Heatmap, heatmap_legend_side = "left", annotation_legend_side = "left")
+exportplots(x = aMSC_LRT_Heatmap, y = "aMSC_LRT_Heatmap", h = 4, w=14) 
+```
+
+#GO enchriment of adult clusters from LRT heatmap (3c)
+```{r}
+#Extract each cluster and run enrichment.
+aMSC.clusters = row_order(aMSC_LRT_Heatmap) #Extract clusters
+
+a.clu.gene <- lapply(names(aMSC.clusters), function(i){
+
+  symbols <- rownames(mean.adult.donor)[aMSC.clusters[[i]]]
+
+  out <- data.frame(
+    Symbol  = symbols,
+    Cluster = paste0("cluster", i),
+    stringsAsFactors = FALSE
+  )
+  out
+})
+
+a<-c() #Create a variable of cluster names the a.clu.gsea.GO indexes represent
+for(i in 1:length(a.clu.gene)){
+  new <- a.clu.gene[[i]][1,2]
+  a <- c(a, new)
+}
+
+names(a.clu.gene) <- a
+
+write.xlsx(a.clu.gene,"/output/ad.LRT.ClusterGenes.xlsx", colNames = TRUE) #Export Cluster Genes
+
+a.clu.gsea.GO = list()
+for(i in 1:length(a.clu.gene)){
+  out.go <- gost(query = a.clu.gene[[i]][,1],
+                 organism = "hsapiens", ordered_query = FALSE, 
+                 multi_query = FALSE, significant = TRUE, exclude_iea = FALSE, 
+                 measure_underrepresentation = FALSE, evcodes = FALSE, 
+                 user_threshold = 0.05, correction_method = "g_SCS", 
+                 domain_scope = "annotated", custom_bg = NULL, 
+                 numeric_ns = "", sources = NULL, as_short_link = FALSE, highlight = TRUE)
+  a.clu.gsea.GO[[i]] <- out.go$result
+}
+
+a<-c() #Create a variable of cluster names the a.clu.gsea.GO indexes represent
+for(i in 1:length(a.clu.gene)){
+  new <- a.clu.gene[[i]][1,2]
+  a <- c(a, new)
+}
+
+names(a.clu.gsea.GO) <- a #Assign meaningful element names to a.clu.gsea.GO
+write.xlsx(a.clu.gsea.GO,"/output/ad.LRT.GO.xlsx", colNames = TRUE)
+```
+
+#Plot a heatmap of the top 50 most significantly DE genes in fMSC, and the corresponding expression in aMSC (4a)
+```{r}
+#Obtain top 50 LRT-DEG in aMSC during differentiation
+f50 = data.frame(LRT.res[[1]])
+f50 = f50[which(f50$padj < 0.01),]
+f50 = f50[order(f50$padj),]
+f50 = f50[1:50,]
+
+hmap.mat = list()
+for (i in 1:2){
+  x = varianceStabilizingTransformation(LRT[[i]], blind = FALSE) #Transform counts
+  mat = assay(x)
+  GOIs = mat[which(rownames(mat) %in% f50$EnsemblID),] #Filter for Genes of interest
+  scaled.hmap.mat = t(apply(GOIs,1,scale)) #Scale the counts for plotting on heatmap
+  colnames(scaled.hmap.mat) = meta[[i]]$label #Change labels to labels column in meta
+  clean.scaled.hmap.mat = scaled.hmap.mat[,duplicated(scaled.hmap.mat[1,]) == FALSE] #Clean mat for duplicated baseline
+  #rownames(clean.scaled.sig.mat) = mapIds(org.Hs.eg.db, keys = rownames(clean.scaled.sig.mat), keytype = "ENSEMBL", column = "SYMBOL") #Replace with Gene Symbols for a more descriptive Heatmap
+  
+  hmap.mat[[i]] = clean.scaled.hmap.mat
+}
+
+#Calculate mean scaled count values
+mean.hmap.mat = list()
+for (i in 1:length(hmap.mat)){
+  mean.mat = matrix(NA, nrow = nrow(hmap.mat[[i]]), ncol = 13) #Initialize a blank matrix to hold mean values
+  colnames(mean.mat) = sub(".*?_", "",colnames(hmap.mat[[i]][,1:13])) #Generate Col Labels for new matrix
+  rownames(mean.mat) = rownames(hmap.mat[[i]]) #Replacing with gene ID row names
+  for(a in 1:13){ #Loop to obtain the average expression for each gene between donors
+    av = rowMeans(hmap.mat[[i]][,seq(a, ncol(hmap.mat[[i]]) , 13)])
+    mean.mat[,a] = av
+  }
+  mean.hmap.mat[[i]] = mean.mat
+}
+
+#fMSC dataset has 3 extra genes that the aMSC did not map to - these need to be removed
+which(rownames(mean.hmap.mat[[1]]) %in% rownames(mean.hmap.mat[[2]]) == FALSE) #These are rows 26, 340 and 506
+which(rownames(mean.hmap.mat[[2]]) %in% rownames(mean.hmap.mat[[1]]) == FALSE)
+
+#Remove unmapped genes
+if (length(which(rownames(mean.hmap.mat[[1]]) %in% rownames(mean.hmap.mat[[2]]) == FALSE)) > 0){
+  f.mat = mean.hmap.mat[[1]][-c(which(rownames(mean.hmap.mat[[1]]) %in% rownames(mean.hmap.mat[[2]]) == FALSE)),]
+}else{
+  f.mat = mean.hmap.mat[[1]]
+}
+f.mat = f.mat[order(rownames(f.mat)),]
+colnames(f.mat)[[1]] = "D0"
+
+#Remove unmapped genes
+if (length(which(rownames(mean.hmap.mat[[2]]) %in% rownames(mean.hmap.mat[[1]]) == FALSE)) > 0){
+  a.mat = mean.hmap.mat[[2]][-c(which(rownames(mean.hmap.mat[[2]]) %in% rownames(mean.hmap.mat[[1]]) == FALSE)),]
+} else{
+    a.mat = mean.hmap.mat[[2]]
+  }
+a.mat = a.mat[order(rownames(a.mat)),]
+colnames(a.mat)[[1]] = "D0"
+
+identical(rownames(f.mat),rownames(a.mat)) #Check whether mat (fetal counts) and a.mat (adult counts) have the same order
+
+f.mat <- cbind(f.mat[,-seq(3,13,2)], f.mat[,seq(3,13,2)]) #Group the IN columns together and the NIN columns together
+colnames(f.mat)[1] <- "D0" #Change the name of the baseline column
+
+a.mat <- cbind(a.mat[,-seq(3,13,2)], a.mat[,seq(3,13,2)]) #Group the IN columns together and the NIN columns together
+colnames(a.mat)[1] <- "D0" #Change the name of the baseline column
+
+a50.mat = cbind(f.mat, a.mat) #Combine the 2 data sets for the heatmap matrix 
+rownames(a50.mat) = mapIds(org.Hs.eg.db, keys = rownames(a50.mat), keytype = "ENSEMBL", column = "SYMBOL") #Turn labels from ensembl id to symbols
+
+#Plot the heatmap
+set.seed(123)
+Time_labels = factor(c("D0", 
+                       rep(c("D1", "D2", "D3", "D4", "D10", "D17"),2)),
+                     levels = c("D0", "D1", "D2", "D3", "D4", "D10", "D17"))
+Fetal_label = factor(rep("Fetal",13), levels = "Fetal")
+Adult_label = factor(rep("Adult",13), levels = "Adult")
+Condition_Labels = factor(c("Baseline", rep("OD",6), rep("CTRL",6)), 
+                       levels = c("Baseline","OD", "CTRL"))
+
+f.ha = HeatmapAnnotation(Time = Time_labels,
+                        Origin = Fetal_label,
+                        Condition = Condition_Labels,
+                        col = list(
+                          Time = c("D17" = "gray1", "D10" = "gray15", "D4" = "gray29", "D3" = "gray44","D2" = "gray59", 
+                                   "D1" = "gray74", "D0" = "gray90"),
+                          Origin = c("Fetal" = "brown"),
+                          Condition = c("Baseline" = "green", "OD" = "magenta","CTRL" = "lightblue")
+                          ),
+                        annotation_name_side = "left")
+
+f.map = Heatmap(a50.mat[,1:13],
+                     show_column_dend = FALSE,
+                     show_row_names = T,
+                     show_row_dend = FALSE,
+                     cluster_columns = FALSE,
+                cluster_rows = T,
+                     top_annotation = f.ha,
+                     name = "Z-Score",
+                     column_title = "Top 50 Fetal Upregulated genes",
+                     column_title_gp = gpar(fontsize = 25, fontface = "bold"),
+                     width = unit(10,"cm"),
+                     #row_km = 3,
+                     column_split = Condition_Labels,
+                     column_gap = unit(5,"mm"),
+                     #use_raster = TRUE,
+                     #raster_quality = 10,
+                     row_gap = unit(2,"mm")
+                     )
+
+a.ha = HeatmapAnnotation(Time = Time_labels,
+                        Origin = Adult_label,
+                        Condition = Condition_Labels,
+                        col = list(
+                          Time = c("D17" = "gray1", "D10" = "gray15", "D4" = "gray29", "D3" = "gray44","D2" = "gray59", 
+                                   "D1" = "gray74", "D0" = "gray90"),
+                          Origin = c("Adult" = "forestgreen"),
+                          Condition = c("Baseline" = "green", "OD" = "magenta","CTRL" = "lightblue")
+                          ),
+                        annotation_name_side = "left")
+
+a.map = Heatmap(a50.mat[,14:26],
+                     show_column_dend = FALSE,
+                     show_row_names = T,
+                     show_row_dend = FALSE,
+                     cluster_columns = FALSE,
+                cluster_rows = T,
+                     top_annotation = a.ha,
+                     name = "Z-Score",
+                     column_title = "Top 50 Fetal Upregulated genes",
+                     column_title_gp = gpar(fontsize = 25, fontface = "bold"),
+                     width = unit(10,"cm"),
+                     #row_km = 3,
+                     column_split = Condition_Labels,
+                     column_gap = unit(5,"mm"),
+                     #use_raster = TRUE,
+                     #raster_quality = 10,
+                     row_gap = unit(2,"mm")
+                     )
+
+fc2.hmap = f.map + a.map
+
+f.diff.genes.hmap = draw(fc2.hmap, heatmap_legend_side = "left", annotation_legend_side = "left", ht_gap = unit(2,"cm"))
+
+exportplots(x = f.diff.genes.hmap,
+            y = "Top 50 Fetal Upregulated genes hmap",
+            h = 10,
+            w = 15)
+
+```
+
+#4a but in greyscale
+```{r}
+## ---- greyscale Z-score ramp, defined ONCE and reused ---------------------
+# Sequential: light = low, dark = high. Greyscale can't render a diverging
+# palette, so zero is read off the legend rather than seen as a colour flip.
+z_lim <- 2                                     # clip Z at +/- 2
+z_col <- colorRamp2(c(-z_lim, 0, z_lim),
+                    c("white", "grey65", "black"))
+
+Condition_Labels = factor(c("Baseline", rep("OD", 6), rep("CTRL", 6)),
+                          levels = c("Baseline", "OD", "CTRL"))
+
+## ---- heatmaps ------------------------------------------------------------
+set.seed(123)
+
+f.map = Heatmap(a50.mat[, 1:13],
+                col  = z_col,
+                name = "Z-Score",
+                show_column_dend  = FALSE,
+                show_column_names = TRUE,
+                show_row_names    = TRUE,
+                show_row_dend     = FALSE,
+                cluster_columns   = FALSE,
+                cluster_rows      = TRUE,
+                border            = TRUE,
+                column_title      = c("Baseline", "OD", "CTRL"),
+                column_title_gp   = gpar(fontsize = 12),
+                width             = unit(10, "cm"),
+                column_split      = Condition_Labels,
+                column_gap        = unit(5, "mm"),
+                row_gap           = unit(2, "mm"))
+
+a.map = Heatmap(a50.mat[, 14:26],
+                col  = z_col,                  # same mapping as fetal
+                name = "Z-Score_adult",        # unique name
+                show_heatmap_legend = FALSE,   # single shared legend
+                show_column_dend  = FALSE,
+                show_column_names = TRUE,
+                show_row_names    = TRUE,
+                show_row_dend     = FALSE,
+                cluster_columns   = FALSE,
+                cluster_rows      = TRUE,
+                border            = TRUE,
+                column_title      = c("Baseline", "OD", "CTRL"),
+                column_title_gp   = gpar(fontsize = 12),
+                width             = unit(10, "cm"),
+                column_split      = Condition_Labels,
+                column_gap        = unit(5, "mm"),
+                row_gap           = unit(2, "mm"))
+
+fc2.hmap = f.map + a.map
+
+f.diff.genes.hmap = draw(fc2.hmap,
+                         column_title    = "Top 50 most significant fetal LRT genes (fetal | adult)",
+                         column_title_gp = gpar(fontsize = 20, fontface = "bold"),
+                         heatmap_legend_side = "left",
+                         ht_gap = unit(2, "cm"))
+
+exportplots(x = f.diff.genes.hmap,
+            y = "Top 50 Fetal genes hmap greyscale",
+            h = 10,
+            w = 15)
+
+```
+
+#Plot a heatmap of the top 50 most significantly DE genes in fMSC, and the corresponding expression in aMSC (4b)
+```{r}
+#Obtain top 50 LRT-DEG in aMSC during differentiation
+a50 = data.frame(LRT.res[[2]])
+a50 = a50[which(a50$padj < 0.01),]
+a50 = a50[order(a50$padj),]
+a50 = a50[1:50,]
+
+GeneList = a50$EnsemblID
+
+hmap.mat = list()
+for (i in 1:2){
+  x = varianceStabilizingTransformation(LRT[[i]], blind = FALSE) #Transform counts
+  mat = assay(x)
+  GOIs = mat[which(rownames(mat) %in% GeneList),] #Filter for Genes of interest
+  scaled.hmap.mat = t(apply(GOIs,1,scale)) #Scale the counts for plotting on heatmap
+  colnames(scaled.hmap.mat) = meta[[i]]$label #Change labels to labels column in meta
+  clean.scaled.hmap.mat = scaled.hmap.mat[,duplicated(scaled.hmap.mat[1,]) == FALSE] #Clean mat for duplicated baseline
+  #rownames(clean.scaled.sig.mat) = mapIds(org.Hs.eg.db, keys = rownames(clean.scaled.sig.mat), keytype = "ENSEMBL", column = "SYMBOL") #Replace with Gene Symbols for a more descriptive Heatmap
+  
+  hmap.mat[[i]] = clean.scaled.hmap.mat
+}
+
+#Calculate mean scaled count values
+mean.hmap.mat = list()
+for (i in 1:length(hmap.mat)){
+  mean.mat = matrix(NA, nrow = nrow(hmap.mat[[i]]), ncol = 13) #Initialize a blank matrix to hold mean values
+  colnames(mean.mat) = sub(".*?_", "",colnames(hmap.mat[[i]][,1:13])) #Generate Col Labels for new matrix
+  rownames(mean.mat) = rownames(hmap.mat[[i]]) #Replacing with gene ID row names
+  for(a in 1:13){ #Loop to obtain the average expression for each gene between donors
+    av = rowMeans(hmap.mat[[i]][,seq(a, ncol(hmap.mat[[i]]) , 13)])
+    mean.mat[,a] = av
+  }
+  mean.hmap.mat[[i]] = mean.mat
+}
+
+#fMSC dataset has 3 extra genes that the aMSC did not map to - these need to be removed
+which(rownames(mean.hmap.mat[[1]]) %in% rownames(mean.hmap.mat[[2]]) == FALSE) #These are rows 26, 340 and 506
+which(rownames(mean.hmap.mat[[2]]) %in% rownames(mean.hmap.mat[[1]]) == FALSE)
+
+#Remove unmapped genes
+if (length(which(rownames(mean.hmap.mat[[1]]) %in% rownames(mean.hmap.mat[[2]]) == FALSE)) > 0){
+  f.mat = mean.hmap.mat[[1]][-c(which(rownames(mean.hmap.mat[[1]]) %in% rownames(mean.hmap.mat[[2]]) == FALSE)),]
+}else{
+  f.mat = mean.hmap.mat[[1]]
+}
+f.mat = f.mat[order(rownames(f.mat)),]
+colnames(f.mat)[[1]] = "D0"
+
+#Remove unmapped genes
+if (length(which(rownames(mean.hmap.mat[[2]]) %in% rownames(mean.hmap.mat[[1]]) == FALSE)) > 0){
+  a.mat = mean.hmap.mat[[2]][-c(which(rownames(mean.hmap.mat[[2]]) %in% rownames(mean.hmap.mat[[1]]) == FALSE)),]
+} else{
+    a.mat = mean.hmap.mat[[2]]
+  }
+a.mat = a.mat[order(rownames(a.mat)),]
+colnames(a.mat)[[1]] = "D0"
+
+identical(rownames(f.mat),rownames(a.mat)) #Check whether mat (fetal counts) and a.mat (adult counts) have the same order
+
+f.mat <- cbind(f.mat[,-seq(3,13,2)], f.mat[,seq(3,13,2)]) #Group the IN columns together and the NIN columns together
+colnames(f.mat)[1] <- "D0" #Change the name of the baseline column
+
+a.mat <- cbind(a.mat[,-seq(3,13,2)], a.mat[,seq(3,13,2)]) #Group the IN columns together and the NIN columns together
+colnames(a.mat)[1] <- "D0" #Change the name of the baseline column
+
+a50.mat = cbind(f.mat, a.mat) #Combine the 2 data sets for the heatmap matrix 
+rownames(a50.mat) = mapIds(org.Hs.eg.db, keys = rownames(a50.mat), keytype = "ENSEMBL", column = "SYMBOL") #Turn labels from ensembl id to symbols
+
+#Plot the heatmap
+set.seed(123)
+Time_labels = factor(c("D0", 
+                       rep(c("D1", "D2", "D3", "D4", "D10", "D17"),2)),
+                     levels = c("D0", "D1", "D2", "D3", "D4", "D10", "D17"))
+Fetal_label = factor(rep("Fetal",13), levels = "Fetal")
+Adult_label = factor(rep("Adult",13), levels = "Adult")
+Condition_Labels = factor(c("Baseline", rep("OD",6), rep("CTRL",6)), 
+                       levels = c("Baseline","OD", "CTRL"))
+
+f.ha = HeatmapAnnotation(Time = Time_labels,
+                        Origin = Fetal_label,
+                        Condition = Condition_Labels,
+                        col = list(
+                          Time = c("D17" = "gray1", "D10" = "gray15", "D4" = "gray29", "D3" = "gray44","D2" = "gray59", 
+                                   "D1" = "gray74", "D0" = "gray90"),
+                          Origin = c("Fetal" = "brown"),
+                          Condition = c("Baseline" = "green", "OD" = "magenta","CTRL" = "lightblue")
+                          ),
+                        annotation_name_side = "left")
+
+f.map = Heatmap(a50.mat[,1:13],
+                     show_column_dend = FALSE,
+                     show_row_names = T,
+                     show_row_dend = FALSE,
+                     cluster_columns = FALSE,
+                     top_annotation = f.ha,
+                     name = "Z-Score",
+                     column_title = "Top 50 Adult Upregulated genes IN",
+                     column_title_gp = gpar(fontsize = 25, fontface = "bold"),
+                     width = unit(10,"cm"),
+                     #row_km = 3,
+                     column_split = Condition_Labels,
+                     column_gap = unit(5,"mm"),
+                     #use_raster = TRUE,
+                     #raster_quality = 10,
+                     row_gap = unit(2,"mm")
+                     )
+
+a.ha = HeatmapAnnotation(Time = Time_labels,
+                        Origin = Adult_label,
+                        Condition = Condition_Labels,
+                        col = list(
+                          Time = c("D17" = "gray1", "D10" = "gray15", "D4" = "gray29", "D3" = "gray44","D2" = "gray59", 
+                                   "D1" = "gray74", "D0" = "gray90"),
+                          Origin = c("Adult" = "forestgreen"),
+                          Condition = c("Baseline" = "green", "OD" = "magenta","CTRL" = "lightblue")
+                          ),
+                        annotation_name_side = "left")
+
+a.map = Heatmap(a50.mat[,14:26],
+                     show_column_dend = FALSE,
+                     show_row_names = T,
+                     show_row_dend = FALSE,
+                     cluster_columns = FALSE,
+                     top_annotation = a.ha,
+                     name = "Z-Score",
+                     column_title = "Top 50 Adult Upregulated genes IN",
+                     column_title_gp = gpar(fontsize = 25, fontface = "bold"),
+                     width = unit(10,"cm"),
+                     #row_km = 3,
+                     column_split = Condition_Labels,
+                     column_gap = unit(5,"mm"),
+                     #use_raster = TRUE,
+                     #raster_quality = 10,
+                     row_gap = unit(2,"mm")
+                     )
+
+fc2.hmap = f.map + a.map
+
+f.diff.genes.hmap = draw(fc2.hmap, heatmap_legend_side = "left", annotation_legend_side = "left", ht_gap = unit(2,"cm"))
+
+exportplots(x = f.diff.genes.hmap,
+            y = "Top 50 Adult Upregulated genes hmap",
+            h = 10,
+            w = 15)
+```
+
+#Session and Reproducibility
+```{r}
+sessionInfo()
+```

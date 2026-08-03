@@ -1,0 +1,719 @@
+---
+title: "Pairwise Enrichment"
+output: html_notebook
+---
+
+# Setup Environment
+```{r setup, error = FALSE, warning = FALSE}
+#Load dependencies
+library(renv)
+library(ggplot2)
+library(org.Hs.eg.db)
+library(ComplexHeatmap)
+library(EnhancedVolcano)
+library(tidyverse)
+library(gdata)
+library(ashr)
+library(openxlsx)
+library(gprofiler2)
+library(circlize)
+library(egg)
+library(biomaRt)
+library(DESeq2)
+library(dplyr)
+library(here)
+
+exportplots <- function(x, y, w, h){
+  as.character(y)
+  png(filename = here::here("output", paste0(y, ".png")), width = w, height = h, units = "in", res = 600)
+  print(x)
+  dev.off()
+}
+```
+
+#Create heatmap plotting function for comparing GO terms across timepoints
+```{r}
+plot_2matrix_GSEA_hmap <- function(GeneList, Matrix, Matrix2, HmapTitle, FileName){
+  
+  #Generate blank matrix to hold values
+  GeneList_Matrix = data.frame(x1 = sort(GeneList),
+                               D1 = 1,
+                               D2 = 1,
+                               D3 = 1,
+                               D4 = 1,
+                               D10 = 1,
+                               D17 = 1)
+  
+  GeneList_Matrix2 = data.frame(x1 = sort(GeneList),
+                               D1 = 1,
+                               D2 = 1,
+                               D3 = 1,
+                               D4 = 1,
+                               D10 = 1,
+                               D17 = 1)
+  
+  #Map the pathways and their corresponding p values to the heatmap matrix
+  for(x in 1:length(Matrix)){
+    for(i in which(Matrix[[x]]$term_name %in% GeneList)){
+      GeneList_Matrix[which(GeneList_Matrix$x1 == Matrix[[x]]$term_name[i]), x+1] = Matrix[[x]][i,3]
+    }
+  }
+  
+  for(x in 1:length(Matrix2)){
+    for(i in which(Matrix2[[x]]$term_name %in% GeneList)){
+      GeneList_Matrix2[which(GeneList_Matrix2$x1 == Matrix2[[x]]$term_name[i]), x+1] = Matrix2[[x]][i,3]
+    }
+  }
+  
+  #concantenate the comparison matrix horizontally
+  all(GeneList_Matrix$x1 %in% GeneList_Matrix2$x1) #Do the GO IDs match between the 2 matrix, in the same order?
+  plot = cbind(GeneList_Matrix,GeneList_Matrix2[,-1])
+  
+  #Setup Matrix for heatmap
+  rownames(plot) = plot$x1
+  plot = plot[,-1]
+  plot = data.matrix(plot)
+  
+  #remove blanks
+  plot <- plot[rowSums(plot != 1) > 0, , drop = FALSE]
+  
+  #Plot Heatmap
+  col_hmap = colorRamp2(c(0,0.05, 1),c("red","pink", "white"))
+  Enrichment_Heatmap = Heatmap(plot,
+                  show_column_dend = FALSE,
+                   show_row_names = T,
+                   show_row_dend = TRUE,
+                   cluster_columns = FALSE,
+                  cluster_rows = TRUE,
+                  column_split = c(rep("A",6), rep("B",6)),
+                  column_gap = unit(5,"mm"),
+                   name = "Adjusted-P Value",
+                   column_title = HmapTitle,
+                   column_title_gp = gpar(fontsize = 25, fontface = "bold"),
+                  row_names_gp = gpar(fontsize = 10),
+                  col = col_hmap,
+                  width = unit(8, "cm"),
+                  height = unit(nrow(plot)*0.5, "cm"),
+                  heatmap_legend_param = list(
+                    at = c(0, 0.01, 0.02, 0.03,0.04,0.05)
+                  
+                  ))
+  Enrichment_Heatmap = draw(Enrichment_Heatmap, heatmap_legend_side = "left")
+  
+  exportplots(x = Enrichment_Heatmap,
+            y = FileName,
+            h = 30,
+            w = 15)
+}
+```
+
+#Load in Data + Meta
+```{r}
+# Load fetal MSC data
+f.counts <- read.csv(here("data", "fMSC_norm_counts.csv"), row.names = 1)
+f.meta   <- read.csv(here("data", "fMSC_meta.csv"), row.names = 1)
+
+# Load adult MSC data
+a.counts <- read.csv(here("data", "aMSC_norm_counts.csv"), row.names = 1)
+a.meta   <- read.csv(here("data", "aMSC_meta.csv"), row.names = 1)
+
+#Create data list and meta list to hold both fetal and adult data
+counts = list(f.counts, a.counts)
+names(counts) = c("fMSC","aMSC")
+
+meta = list(f.meta, a.meta)
+names(meta) = c("fMSC","aMSC")
+
+#Correct levels in meta file
+meta[[1]]$Time <- factor(meta[[1]]$Time, levels = c("D0", "D1", "D2", "D3", "D4", "D10", "D17"))
+meta[[2]]$Time <- factor(meta[[2]]$Time, levels = c("D0", "D1", "D2", "D3", "D4", "D10", "D17"))
+```
+
+#Filter for Protein Coding Genes
+```{r}
+mart <- useEnsembl(
+  biomart = "genes",
+  dataset = "hsapiens_gene_ensembl",
+  mirror = "useast"          # safer for publication
+)
+coding.counts = list()
+
+for(i in 1:length(counts)){
+
+  genes <- rownames(counts[[i]])
+  annot <- getBM(
+    attributes = c("ensembl_gene_id", "gene_biotype"),
+    filters = "ensembl_gene_id",
+    values = genes,
+    mart = mart
+    )
+  
+  # Keep protein-coding genes
+  protein_coding_genes <- annot$ensembl_gene_id[annot$gene_biotype == "protein_coding"]
+  coding.counts[[i]] <- counts[[i]][rownames(counts[[i]]) %in% protein_coding_genes, ]
+}
+```
+
+#Create dds for pairwise comparisons at each time point between OD and CTRL
+```{r}
+#Time_labels = c("D0", "D1","D2","D3","D4","D10", "D17","D1","D2","D3","D4","D10", "D17")
+#Time_labels = factor(Time_labels, levels = c("D0", "D1", "D2", "D3", "D4", "D10", "D17"))
+
+pair = list()
+
+for(i in 1:length(counts)){
+  common_samples <- intersect(colnames(coding.counts[[i]]), rownames(meta[[i]]))
+  counts_mat <- coding.counts[[i]][ , common_samples]
+  metadata   <- meta[[i]][common_samples, ]
+  
+  # Convert categorical columns to factors
+  metadata$Time      <- factor(metadata$Time, levels = c("D0", "D1","D2","D3","D4","D10","D17"))
+  metadata$Condition <- factor(metadata$Condition)
+  metadata$Donor     <- factor(metadata$Donor)
+  
+  # Create DESeq dataset
+  x <- DESeqDataSetFromMatrix(countData = round(counts_mat),
+                              colData = metadata,
+                              design = ~ 1)
+  
+  # Prefilter low counts
+  keep <- rowSums(counts(x) >= 10) >= 3
+  x <- x[keep,]
+  
+  # Construct group and design
+  x$group <- factor(paste0(x$Time, x$Condition))
+  design(x) <- ~ group + Donor
+  
+  # Run DESeq
+  x <- DESeq(x)
+  
+  # Save result
+  pair[[i]] <- x
+}
+```
+
+#Fetal Pairwise Comparisons
+```{r}
+Time_labels = c("D0", "D1","D2","D3","D4","D10", "D17","D1","D2","D3","D4","D10", "D17")
+Time_labels = factor(Time_labels, levels = c("D0", "D1", "D2", "D3", "D4", "D10", "D17"))
+
+f.pair.res = list()
+f.pair.res[[1]] <- lfcShrink(pair[[1]], contrast=c("group","D1OD","D1CTRL"), type = "ashr", lfcThreshold = 1)
+f.pair.res[[2]] <- lfcShrink(pair[[1]], contrast=c("group","D2OD","D2CTRL"), type = "ashr", lfcThreshold = 1)
+f.pair.res[[3]] <- lfcShrink(pair[[1]], contrast=c("group","D3OD","D3CTRL"), type = "ashr", lfcThreshold = 1)
+f.pair.res[[4]] <- lfcShrink(pair[[1]], contrast=c("group","D4OD","D4CTRL"), type = "ashr", lfcThreshold = 1)
+f.pair.res[[5]] <- lfcShrink(pair[[1]], contrast=c("group","D10OD","D10CTRL"), type = "ashr", lfcThreshold = 1)
+f.pair.res[[6]] <- lfcShrink(pair[[1]], contrast=c("group","D17OD","D17CTRL"), type = "ashr", lfcThreshold = 1)
+names(f.pair.res) = levels(Time_labels)[-1]
+
+for(i in 1:length(f.pair.res)){ #Add EnsemblID and Symbol names
+  f.pair.res[[i]]$EnsemblID = rownames(f.pair.res[[i]])
+  f.pair.res[[i]]$Symbol = mapIds(org.Hs.eg.db, keys = f.pair.res[[i]]$EnsemblID, keytype = "ENSEMBL", column = "SYMBOL")
+}
+
+write.xlsx(f.pair.res,
+           here("output", "Fetal Pairwise Comparisons.xlsx"), 
+           colNames = TRUE, 
+           rownames = TRUE)
+```
+
+#GO Enrichment of each timepoint fMSC
+```{r}
+#Fetal OD
+f.pair.gsea = list()
+for(i in 1:length(f.pair.res)){
+   x = gost(query = f.pair.res[[i]][f.pair.res[[i]]$log2FoldChange > 1 & f.pair.res[[i]]$padj < 0.01,8],
+                organism = "hsapiens", ordered_query = FALSE, 
+                multi_query = FALSE, significant = TRUE, exclude_iea = FALSE, 
+                measure_underrepresentation = FALSE, evcodes = TRUE, 
+                user_threshold = 0.05, correction_method = "g_SCS", 
+                domain_scope = "annotated", custom_bg = NULL, 
+                numeric_ns = "", as_short_link = FALSE, highlight = TRUE,
+                sources = "GO:BP")
+   f.pair.gsea[[i]] = x$result
+   
+   if(!is.null(x)){
+   }
+}
+
+gsea_OD_labels = c("D1_OD_GO","D2_OD_GO","D3_OD_GO","D4_OD_GO","D10_OD_GO", "D17_OD_GO")
+names(f.pair.gsea) = gsea_OD_labels
+write.xlsx(f.pair.gsea, here("output", "Fetal Pairwise OD GO.xlsx"), colNames = TRUE, rownames = TRUE)
+
+#Fetal CTRL
+f.pair.gsea.CTRL = list()
+for(i in 2:length(f.pair.res)){
+  tryCatch({
+    x = gost(query = f.pair.res[[i]][f.pair.res[[i]]$log2FoldChange < -1 & f.pair.res[[i]]$padj < 0.01,8],
+                organism = "hsapiens", ordered_query = FALSE, 
+                multi_query = FALSE, significant = TRUE, exclude_iea = FALSE, 
+                measure_underrepresentation = FALSE, evcodes = TRUE, 
+                user_threshold = 0.05, correction_method = "g_SCS", 
+                domain_scope = "annotated", custom_bg = NULL, 
+                numeric_ns = "", as_short_link = FALSE, highlight = TRUE,
+                sources = c("GO:BP"))
+  }, error = function(e){})
+   f.pair.gsea.CTRL[[i]] = x$result
+}
+
+gsea_CTRL_labels = c("D1_CTRL_GO","D2_CTRL_GO","D3_CTRL_GO","D4_CTRL_GO","D10_CTRL_GO", "D17_CTRL_GO")
+names(f.pair.gsea.CTRL) = gsea_CTRL_labels
+write.xlsx(f.pair.gsea.CTRL,
+           here("output", "Fetal Pairwise CTRL GO.xlsx"), 
+           colNames = TRUE, rownames = TRUE)
+```
+
+#Filter GO terms for each themes
+```{r}
+#Filter for specific pathway themes: 
+bone = c()
+diff = c()
+immune = c()
+secretion = c()
+metabolism = c()
+
+#Fetal OD
+for(i in 1:length(f.pair.gsea)){
+  b  = f.pair.gsea[[i]][which(grepl("bone|skele|collagen|matrix|osteo|oss", f.pair.gsea[[i]]$term_name)), 11]
+  bone = c(bone, b)
+  bone = unique(bone)
+
+  d  = f.pair.gsea[[i]][which(grepl("diff|genesis|genic", f.pair.gsea[[i]]$term_name)), 11]
+  diff = c(diff, d)
+  diff = unique(diff)
+  
+  im = f.pair.gsea[[i]][which(grepl("anti|immune|defence", f.pair.gsea[[i]]$term_name)), 11]
+  immune = c(immune, im)
+  immune = unique(immune)
+  
+  s  = f.pair.gsea[[i]][which(grepl("secret|exoc|vesicle", f.pair.gsea[[i]]$term_name)), 11]
+  secretion = c(secretion, s)
+  secretion = unique(secretion)
+  
+  m  = f.pair.gsea[[i]][which(grepl("homeotasis|metabolism|lysis|process|oxida|reduc", f.pair.gsea[[i]]$term_name)), 11]
+  metabolism = c(metabolism, m)
+  metabolism = unique(metabolism)
+}
+
+#Fetal CTRL
+for(i in 1:length(f.pair.gsea.CTRL)){
+  b  = f.pair.gsea.CTRL[[i]][which(grepl("bone|skele|collagen|matrix|osteo|oss", f.pair.gsea.CTRL[[i]]$term_name)), 11]
+  bone = c(bone, b)
+  bone = unique(bone)
+
+  d  = f.pair.gsea.CTRL[[i]][which(grepl("diff|genesis|genic", f.pair.gsea.CTRL[[i]]$term_name)), 11]
+  diff = c(diff, d)
+  diff = unique(diff)
+  
+  im = f.pair.gsea.CTRL[[i]][which(grepl("anti|immune|defence", f.pair.gsea.CTRL[[i]]$term_name)), 11]
+  immune = c(immune, im)
+  immune = unique(immune)
+  
+  s  = f.pair.gsea.CTRL[[i]][which(grepl("secret|exoc|vesicle", f.pair.gsea.CTRL[[i]]$term_name)), 11]
+  secretion = c(secretion, s)
+  secretion = unique(secretion)
+  
+  m  = f.pair.gsea.CTRL[[i]][which(grepl("homeotasis|metabolism|lysis|process|oxida|reduc", f.pair.gsea.CTRL[[i]]$term_name)), 11]
+  metabolism = c(metabolism, m)
+  metabolism = unique(metabolism)
+}
+```
+
+#Plot Fetal GO timepoint heatmaps (fig 5&6)
+```{r}
+plot_2matrix_GSEA_hmap(GeneList = bone,
+               Matrix = f.pair.gsea,
+               Matrix2 = f.pair.gsea.CTRL,
+               HmapTitle = "Bone: fMSC OD_CTRL",
+               FileName = "fMSC OD_CTRL Bone Pairwise Enrichmnet")
+
+
+plot_2matrix_GSEA_hmap(GeneList = diff,
+               Matrix = f.pair.gsea,
+               Matrix2 = f.pair.gsea.CTRL,
+               HmapTitle = "Diff: fMSC OD_CTRL",
+               FileName = "fMSC OD_CTRL Diff Pairwise Enrichmnet")
+
+
+plot_2matrix_GSEA_hmap(GeneList = immune,
+               Matrix = f.pair.gsea,
+               Matrix2 = f.pair.gsea.CTRL,
+               HmapTitle = "Immune: fMSC OD_CTRL",
+               FileName = "fMSC OD_CTRL Immune Pairwise Enrichmnet")
+
+plot_2matrix_GSEA_hmap(GeneList = metabolism,
+               Matrix = f.pair.gsea,
+               Matrix2 = f.pair.gsea.CTRL,
+               HmapTitle = "Metabolism: fMSC OD_CTRL",
+               FileName = "fMSC OD_CTRL Metabolism Pairwise Enrichmnet")
+```
+
+#Adult Pairwise DEGs
+```{r}
+a.pair.res = list()
+a.pair.res[[1]] <- lfcShrink(pair[[2]], contrast=c("group","D1OD","D1CTRL"), type = "ashr", lfcThreshold = 1)
+a.pair.res[[2]] <- lfcShrink(pair[[2]], contrast=c("group","D2OD","D2CTRL"), type = "ashr", lfcThreshold = 1)
+a.pair.res[[3]] <- lfcShrink(pair[[2]], contrast=c("group","D3OD","D3CTRL"), type = "ashr", lfcThreshold = 1)
+a.pair.res[[4]] <- lfcShrink(pair[[2]], contrast=c("group","D4OD","D4CTRL"), type = "ashr", lfcThreshold = 1)
+a.pair.res[[5]] <- lfcShrink(pair[[2]], contrast=c("group","D10OD","D10CTRL"), type = "ashr", lfcThreshold = 1)
+a.pair.res[[6]] <- lfcShrink(pair[[2]], contrast=c("group","D17OD","D17CTRL"), type = "ashr", lfcThreshold = 1)
+names(a.pair.res) = levels(Time_labels)[-1]
+
+for(i in 1:length(a.pair.res)){ #Add EnsemblID and Symbol names
+  a.pair.res[[i]]$EnsemblID = rownames(a.pair.res[[i]])
+  a.pair.res[[i]]$Symbol = mapIds(org.Hs.eg.db, keys = a.pair.res[[i]]$EnsemblID, keytype = "ENSEMBL", column = "SYMBOL")
+}
+
+write.xlsx(a.pair.res,
+           here("output", "Adult Pairwise DEGs"),
+           colNames = TRUE, 
+           rownames = TRUE)
+```
+
+#GO Enrichment of each timepoint aMSC
+```{r}
+#Adult OD
+a.pair.gsea = list()
+for(i in 1:length(a.pair.res)){
+   x = gost(query = a.pair.res[[i]][a.pair.res[[i]]$log2FoldChange > 1 & a.pair.res[[i]]$padj < 0.01,8],
+                organism = "hsapiens", ordered_query = FALSE, 
+                multi_query = FALSE, significant = TRUE, exclude_iea = FALSE, 
+                measure_underrepresentation = FALSE, evcodes = TRUE, 
+                user_threshold = 0.05, correction_method = "g_SCS", 
+                domain_scope = "annotated", custom_bg = NULL, 
+                numeric_ns = "", as_short_link = FALSE, highlight = TRUE,
+                sources = "GO:BP")
+   a.pair.gsea[[i]] = x$result
+   
+   if(!is.null(x)){
+   }
+}
+
+names(a.pair.gsea) = gsea_OD_labels
+write.xlsx(a.pair.gsea,
+           here("output", "Adult Pairwise OD GO.xlsx"),
+           colNames = TRUE, rownames = TRUE)
+
+#Adult CTRL
+a.pair.gsea.CTRL = list()
+for(i in 2:length(a.pair.res)){
+  tryCatch({
+    x = gost(query = a.pair.res[[i]][a.pair.res[[i]]$log2FoldChange < -1 & a.pair.res[[i]]$padj < 0.01,8],
+                organism = "hsapiens", ordered_query = FALSE, 
+                multi_query = FALSE, significant = TRUE, exclude_iea = FALSE, 
+                measure_underrepresentation = FALSE, evcodes = TRUE, 
+                user_threshold = 0.05, correction_method = "g_SCS", 
+                domain_scope = "annotated", custom_bg = NULL, 
+                numeric_ns = "", as_short_link = FALSE, highlight = TRUE,
+                sources = c("GO:BP"))
+  }, error = function(e){})
+   a.pair.gsea.CTRL[[i]] = x$result
+
+}
+
+names(a.pair.gsea.CTRL) = gsea_CTRL_labels
+write.xlsx(a.pair.gsea.CTRL,
+           here("output", "Adult Pairwise CTRL GO.xlsx"),
+           colNames = TRUE, rownames = TRUE)
+```
+
+#Plot Fetal OD vs Adult GO GO timepoint heatmaps (fig 5&6)
+```{r}
+plot_2matrix_GSEA_hmap(GeneList = bone,
+               Matrix = f.pair.gsea,
+               Matrix2 = a.pair.gsea,
+               HmapTitle = "Bone: fMSC OD, aMSC OD",
+               FileName = "fMSC OD_aMSC OD Bone Pairwise Enrichmnet")
+
+
+plot_2matrix_GSEA_hmap(GeneList = diff,
+               Matrix = f.pair.gsea,
+               Matrix2 = a.pair.gsea,
+               HmapTitle = "Diff: fMSC OD, aMSC OD",
+               FileName = "fMSC OD_aMSC OD Diff Pairwise Enrichmnet")
+
+
+plot_2matrix_GSEA_hmap(GeneList = immune,
+               Matrix = f.pair.gsea,
+               Matrix2 = a.pair.gsea,
+               HmapTitle = "Immune: fMSC OD, aMSC OD",
+               FileName = "fMSC OD_aMSC OD Immune Pairwise Enrichmnet")
+
+plot_2matrix_GSEA_hmap(GeneList = metabolism,
+               Matrix = f.pair.gsea,
+               Matrix2 = a.pair.gsea,
+               HmapTitle = "Metabolism: fMSC OD, aMSC OD",
+               FileName = "fMSC OD_aMSC OD Metabolism Pairwise Enrichmnet")
+```
+
+#Function to plot normalized counts of individual genes, using the gene symbol as a string
+```{r}
+plot_single_gene_counts <- function(Gene){
+  
+  #For Fetal
+  f.geneCounts <- plotCounts(f.d4.dds, 
+                         gene = rownames(f.pair.res[[4]])[which(f.pair.res[[4]][,9] == Gene)],
+                         intgroup = c("Condition","Donor"),
+                         returnData = TRUE,
+                         )
+  
+    a.geneCounts <- plotCounts(a.d4.dds, 
+                         gene = rownames(a.pair.res[[4]])[which(a.pair.res[[4]][,9] == Gene)],
+                         intgroup = c("Condition","Donor"),
+                         returnData = TRUE,
+                         )
+  
+  p1 <- ggplot(f.geneCounts, aes(x = Condition, y = count, colour = Donor, group = Donor)) + 
+  scale_y_log10() +
+  geom_point(size=2)+
+  geom_line()+
+  theme_classic()+
+  ggtitle(paste0("Fetal ",Gene,sep=" "))+
+  ylab("Normalized Counts")+
+  scale_y_continuous(limits = c(0, max(f.geneCounts$count, a.geneCounts$count*1.1)))+
+  theme(legend.position = "bottom")
+  
+  p2 <- ggplot(a.geneCounts, aes(x = Condition, y = count, colour = Donor, group = Donor)) + 
+  scale_y_log10() +
+  geom_point(size=2)+
+  geom_line()+
+  theme_classic()+
+  ggtitle(paste0("Adult ",Gene,sep=" "))+
+  ylab("Normalized Counts")+
+  scale_y_continuous(limits = c(0,max(f.geneCounts$count, a.geneCounts$count*1.1)))+
+  theme(legend.position = "bottom")
+  
+  exportplots(x = ggarrange(p1,p2, ncol = 2), y = paste0(Gene), h = 4, w=7)  
+  }
+```
+
+#There appears to be some genes that are differentially regulated between fetal and Adult at D4, we want to plot the counts of these genes to investigate further (7e-h)
+```{r}
+f.d4.dds = pair[[1]][, which(pair[[1]]$Time == "D4")] 
+a.d4.dds = pair[[2]][, which(pair[[2]]$Time == "D4")] 
+
+plot_single_gene_counts(Gene = "TXNIP")
+plot_single_gene_counts(Gene = "FKBP5")
+plot_single_gene_counts(Gene = "TRNP1")
+plot_single_gene_counts(Gene = "ZBTB16")
+```
+
+#We want to investigate D4 Od vs Ctrl as it appears to be a critical timepoint in differentiation (Fetal) (7a)
+```{r}
+resD4 <- data.frame(f.pair.res[[4]])
+resD4_reorder <- resD4[order(resD4$padj, decreasing = FALSE),]
+
+#Visualize Significant DEGs as a Volcano Plot
+keyvals.colour <- ifelse(
+  resD4$log2FoldChange < -1 & resD4$padj < 0.01, 'blue',
+      ifelse(resD4$log2FoldChange > 1 & resD4$padj < 0.01, 'red',
+        'black'))
+
+keyvals.colour[is.na(keyvals.colour)] <- 'black'
+names(keyvals.colour)[keyvals.colour == 'blue'] <- 'CTRL'
+names(keyvals.colour)[keyvals.colour == 'black'] <- 'N.S'
+names(keyvals.colour)[keyvals.colour == 'red'] <- 'OD'
+
+#how many significant upregulated genes in OD? 692 genes
+length(which(resD4$log2FoldChange > 1 & resD4$padj < 0.01))
+
+#how many significant upregulated genes in CTRL? 410 genes
+length(which(resD4$log2FoldChange < -1 & resD4$padj < 0.01))
+
+png(here("output", "D4 Fetal Volcano.png"), units = "in", width = 8, height = 8, res = 300)
+EnhancedVolcano(resD4, x = "log2FoldChange", y = "padj", lab = resD4$Symbol, drawConnectors = TRUE, selectLab = resD4_reorder[1:15,9], pCutoff = 0.01, FCcutoff = 1, title = "DEGs at D4", pointSize = 2.0, colAlpha = 1, colCustom = keyvals.colour, gridlines.major = FALSE, gridlines.minor = F, xlab = "Log2 Fold Change", ylab = "-log10(padj)")
+dev.off()
+
+```
+
+#Enrichment of D4 OD vs CTRL (Fetal, 7b)
+```{r}
+gostres <- gost(query = resD4[resD4$log2FoldChange > 1 & resD4$padj < 0.01,8],
+     ordered_query = FALSE,
+     organism = 'hsapiens',
+     significant = TRUE,
+     user_threshold = 0.05,
+     correction_method = "fdr",
+     exclude_iea = FALSE,
+     sources = c("KEGG","REAC","WP")
+     )
+
+names(gostres)
+
+saveRDS(gostres, "D4ODvCTRL fMSC enrichment plot.rds")
+
+gostplot(gostres, capped = TRUE, interactive = TRUE)
+
+p <- gostplot(gostres, capped = FALSE, interactive = FALSE)
+
+pp <- publish_gostplot(p, highlight_terms = gostres$result[c(2,5,8,10,21,17,37,40,41,45,49,50,58,71,78,80,81),9],
+                       width = 10, height = 10, filename = here('output','D4 Fetal GO plot.png'))
+
+```
+
+#We want to investigate D4 Od vs Ctrl as it appears to be a critical timepoint in differentiation (Adult 7c)
+```{r}
+resD4 <- data.frame(a.pair.res[[4]])
+resD4_reorder <- resD4[order(resD4$padj, decreasing = FALSE),]
+
+#Visualize Significant DEGs as a Volcano Plot
+keyvals.colour <- ifelse(
+  resD4$log2FoldChange < -1 & resD4$padj < 0.01, 'blue',
+      ifelse(resD4$log2FoldChange > 1 & resD4$padj < 0.01, 'red',
+        'black'))
+
+keyvals.colour[is.na(keyvals.colour)] <- 'black'
+names(keyvals.colour)[keyvals.colour == 'blue'] <- 'CTRL'
+names(keyvals.colour)[keyvals.colour == 'black'] <- 'N.S'
+names(keyvals.colour)[keyvals.colour == 'red'] <- 'OD'
+
+#how many significant upregulated genes in OD? 481 genes
+length(which(resD4$log2FoldChange > 1 & resD4$padj < 0.01))
+
+#how many significant upregulated genes in CTRL? 615 genes
+length(which(resD4$log2FoldChange < -1 & resD4$padj < 0.01))
+
+png(here("output", "D4 Adult Volcano.png"), units = "in", width = 8, height = 8, res = 300)
+
+EnhancedVolcano(resD4, x = "log2FoldChange", y = "padj", lab = resD4$Symbol, drawConnectors = TRUE, selectLab = resD4_reorder[1:15,9], max.overlaps = Inf, pCutoff = 0.01, FCcutoff = 1, title = "DEGs at D4", pointSize = 2.0, colAlpha = 1, colCustom = keyvals.colour, gridlines.major = FALSE, gridlines.minor = F, xlab = "Log2 Fold Change", ylab = "-log10(padj)")
+
+dev.off()
+```
+
+#Enrichment of D4 OD vs CTRL (Adult 7d)
+```{r}
+gostres <- gost(query = resD4[resD4$log2FoldChange > 1 & resD4$padj < 0.01,8],
+     ordered_query = FALSE,
+     organism = 'hsapiens',
+     significant = TRUE,
+     user_threshold = 0.05,
+     correction_method = "fdr",
+     exclude_iea = FALSE,
+     sources = c("KEGG","REAC","WP")
+     )
+
+names(gostres)
+
+saveRDS(gostres, "D4ODvCTRL aMSC enrichment plot.rds")
+
+gostplot(gostres, capped = TRUE, interactive = TRUE)
+
+p <- gostplot(gostres, capped = FALSE, interactive = FALSE)
+
+pp <- publish_gostplot(p, highlight_terms = gostres$result[c(4, 11, 14, 18 , 24),9],
+                       width = 10, height = 8, filename = here("output", "D4 Adult GO plot.png"))
+```
+
+#Modify the single gene plotting function to use all timepoints instead of just d4
+```{r}
+#Modify the single gene plotting function to use all timepoints instead of just d4
+plot_single_gene_counts <- function(Gene){
+  
+  data_summary <- function(data, varname, groupnames){
+    require(plyr)
+    summary_func <- function(x, col){
+     c(mean = mean(x[[col]], na.rm=TRUE),
+      sd = sd(x[[col]], na.rm=TRUE))
+    }
+  data_sum<-ddply(data, groupnames, .fun=summary_func,
+                  varname)
+  data_sum <- rename(data_sum, c("mean" = varname))
+      return(data_sum)
+  }
+  
+  #For Fetal
+  f.geneCounts <- plotCounts(pair[[1]], 
+                         gene = rownames(f.pair.res[[4]])[which(f.pair.res[[4]][,9] == Gene)],
+                         intgroup = c("Time","Condition"),
+                         returnData = TRUE,
+                         )
+  
+  f <- data_summary(f.geneCounts, varname="count", 
+                    groupnames=c("Time", "Condition"))
+  
+  a.geneCounts <- plotCounts(pair[[2]], 
+                         gene = rownames(a.pair.res[[4]])[which(a.pair.res[[4]][,9] == Gene)],
+                         intgroup = c("Time","Condition"),
+                         returnData = TRUE,
+                         )
+   
+  a <- data_summary(a.geneCounts, varname="count", 
+                    groupnames=c("Time", "Condition"))
+  
+  pd <- position_dodge(0.5) # move them .05 to the left and right
+
+  p1 <- ggplot(f, aes(x = Time, y = count, color = Condition, group = Condition)) + 
+  scale_y_log10() +
+  geom_point(position = pd, size=4)+
+  theme_classic()+
+  ggtitle(paste0("Fetal ",Gene,sep=""))+
+  ylab("Normalized Counts")+
+  scale_color_manual(values=c("lightblue", "magenta"))+
+  scale_y_continuous(limits = c(0, max(f.geneCounts$count, a.geneCounts$count*1.1)))+
+  theme(axis.text.x = element_text(size=7), axis.text.y = element_text(size=7))+
+  theme(legend.position = "bottom")+ 
+  geom_errorbar(aes(ymax = ifelse(count+sd > max(f.geneCounts$count, a.geneCounts$count*1.1), max(f.geneCounts$count, a.geneCounts$count*1.1), count+sd), ymin = ifelse(count-sd < 0, 0, count-sd)), 
+                width=0.2, color = "black", position=pd)
+
+  p2 <- ggplot(a, aes(x = Time, y = count, color = Condition, group = Condition)) + 
+  scale_y_log10() +
+  geom_point(position = pd, size=4)+
+  theme_classic()+
+  ggtitle(paste0("Adult ",Gene,sep=""))+
+  ylab("Normalized Counts")+
+  scale_color_manual(values=c("lightblue", "magenta"))+
+  scale_y_continuous(limits = c(0,max(f.geneCounts$count, a.geneCounts$count*1.1)))+
+  theme(axis.text.x = element_text(size=7), axis.text.y = element_text(size=7))+
+  theme(legend.position = "bottom")+
+  geom_errorbar(aes(ymax = ifelse(count+sd > max(f.geneCounts$count, a.geneCounts$count*1.1),max(f.geneCounts$count, a.geneCounts$count*1.1), count+sd), ymin = ifelse(count-sd < 0, 0, count-sd)), width=0.2, color = "black", position=pd)
+  
+  exportplots(x = ggarrange(p1,p2, ncol = 2), y = Gene, h = 4, w=6)  
+}
+```
+
+#Plot stemness related genes
+```{r}
+plot_single_gene_counts(Gene = "KLF4")
+plot_single_gene_counts(Gene = "MYC")
+plot_single_gene_counts(Gene = "NOTCH1")
+plot_single_gene_counts(Gene = "DNMT1")
+plot_single_gene_counts(Gene = "TET2")
+plot_single_gene_counts(Gene = "LRP5")
+plot_single_gene_counts(Gene = "FGF2")
+plot_single_gene_counts(Gene = "PMF1-BGLAP")
+plot_single_gene_counts(Gene = "RUNX2")
+plot_single_gene_counts(Gene = "ALPL")
+plot_single_gene_counts(Gene = "COL1A1")
+plot_single_gene_counts(Gene = "CEBPA")
+plot_single_gene_counts(Gene = "PPARG")
+plot_single_gene_counts(Gene = "ACAN")
+plot_single_gene_counts(Gene = "COMP")
+plot_single_gene_counts(Gene = "SOX9")
+plot_single_gene_counts(Gene = "FKBP5")
+plot_single_gene_counts(Gene = "TRNP1")
+plot_single_gene_counts(Gene = "ZBTB16")
+plot_single_gene_counts(Gene = "TXNIP")
+plot_single_gene_counts(Gene = "ENG")
+plot_single_gene_counts(Gene = "NT5E")
+plot_single_gene_counts(Gene = "THY1")
+plot_single_gene_counts(Gene = "MME")
+plot_single_gene_counts(Gene = "FUT4")
+plot_single_gene_counts(Gene = "LEPR")
+plot_single_gene_counts(Gene = "FZD4")
+plot_single_gene_counts(Gene = "CD34")
+plot_single_gene_counts(Gene = "CD44")
+plot_single_gene_counts(Gene = "CD14")
+plot_single_gene_counts(Gene = "ITGB1")
+plot_single_gene_counts(Gene = "TFRC")
+plot_single_gene_counts(Gene = "SOX11")
+plot_single_gene_counts(Gene = "ANPEP")
+plot_single_gene_counts(Gene = "EBF1")
+plot_single_gene_counts(Gene = "CTNNB1")
+plot_single_gene_counts(Gene = "CBFA2T2")
+plot_single_gene_counts(Gene = "CTNNB1")
+```
+
+
+```{r}
+sessionInfo()
+```
