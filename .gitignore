@@ -1,4 +1,4 @@
 notebooks_for_submission/.RData
 notebooks_for_submission/.RDataTmp
 *.csv
-/data
+data/
