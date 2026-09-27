@@ -1,0 +1,406 @@
+---
+title: "Differentiation potency of fetal and adult MSCs by single-cell entropy (SCENT)"
+subtitle: "Signalling entropy rate across osteogenic differentiation, each cohort normalised separately"
+author: "Charles"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+    theme: flatly
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 8, fig.height = 5, dpi = 150)
+```
+
+# Background
+
+This document computes the **signalling entropy rate (SR)** for the fetal (fMSC)
+and adult (aMSC) osteogenic differentiation time courses, following
+
+> Teschendorff AE, Enver T. *Single-cell entropy for accurate estimation of
+> differentiation potency from a cell's transcriptome.* **Nat Commun** 8:15599 (2017).
+> doi:10.1038/ncomms15599
+
+with the method as originally introduced in Banerji *et al.*, *Sci Rep* 3:3039 (2013).
+
+SR treats the transcriptome as a weighting of a protein-protein interaction (PPI)
+network and measures the *promiscuity* of signalling flux over that network. A
+random walk is defined on the PPI adjacency matrix $A$ with the expression vector
+$x$ as node weights,
+
+$$p_{ij} = \frac{a_{ij}\,x_j}{s_i}, \qquad s_i = \sum_j a_{ij} x_j,$$
+
+whose stationary distribution is $\pi_i = x_i s_i / \sum_k x_k s_k$. With local
+entropies $S_i = -\sum_j p_{ij}\log p_{ij}$, the global rate is normalised by the
+maximum entropy rate of the network, $\log\lambda_{\max}(A)$:
+
+$$\mathrm{SR} = \frac{\sum_i \pi_i S_i}{\log \lambda_{\max}(A)} \in [0,1].$$
+
+High SR means signalling flux is spread broadly over the network — the signature of
+an undifferentiated, high-potency state. SR falls as cells commit.
+
+**Scope note.** These are bulk RNA-seq libraries, not single cells. SR is well
+defined on bulk data (that is where the method originated), but a bulk value is a
+population average and cannot resolve potency heterogeneity *between* cells, which
+is the specific contribution of the 2017 paper. Interpret each value as the mean
+potency of the population in that well.
+
+# Cohorts are scored separately
+
+The fetal and adult cohorts were sequenced in different batches, so cohort is
+confounded with batch. Both cohorts are therefore processed **independently and in
+sequence** in this one document: gene filtering, the variance-stabilising
+transform, and the PPI subnetwork are all derived within a cohort, and no
+cross-cohort normalisation is attempted.
+
+The consequence is that **the two sets of SR values are not on a common scale**.
+Each cohort yields a different set of expressed genes, hence a different maximally
+connected subnetwork and a different normalising constant $\log\lambda_{\max}$.
+Within-cohort contrasts — time, and OD versus CTRL — are unaffected and are the
+intended readout. The combined figure below uses free y-axes for that reason, and
+no fetal-versus-adult test is performed.
+
+# Dependencies
+
+```{r install, eval=FALSE}
+# Run once. SCENT is not on CRAN/Bioconductor.
+#install.packages(c("igraph", "Matrix", "ggplot2", "dplyr", "tidyr", "knitr"))
+#if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+#BiocManager::install(c("DESeq2", "org.Hs.eg.db", "AnnotationDbi"))
+#remotes::install_github("aet21/SCENT")   # optional; a fallback is provided below
+```
+
+```{r libs}
+library(Matrix)
+library(igraph)
+library(DESeq2)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+PROJECT <- normalizePath("/Users/yuk.kit.lor/Library/CloudStorage/OneDrive-KarolinskaInstitutet/Longitudinal Osteogenic Differentiation/Submission/fetal_adult_RNA_seq/")        # repository root, from reports/scent/
+OUTDIR  <- file.path(PROJECT, "output", "scent")
+dir.create(OUTDIR, showWarnings = FALSE, recursive = TRUE)
+
+COHORTS <- c("fetal", "adult")
+TORDER  <- c("D0", "D1", "D2", "D3", "D4", "D10", "D17")
+PAL     <- c(Base = "grey40", OD = "#c0392b", CTRL = "#2980b9")
+```
+
+# Input data
+
+```{r load}
+counts_all <- read.csv(file.path(PROJECT, "data", "rawcounts.csv"),
+                       row.names = 1, check.names = FALSE)
+rownames(counts_all) <- sub("\\..*$", "", rownames(counts_all))  # strip versions
+
+coldata <- read.csv(file.path(PROJECT, "data", "coldata_merged.csv"),
+                    row.names = 1, check.names = FALSE)
+coldata$SR <- NULL                       # recomputing from scratch here
+
+cat(sprintf("counts: %d genes x %d libraries\n",
+            nrow(counts_all), ncol(counts_all)))
+table(coldata$cohort, coldata$Condition)
+```
+
+The `net17Jan16` network shipped with SCENT (11,751 nodes, Entrez IDs, derived from
+Pathway Commons). A copy lives in the repository so this document is
+self-contained. **SR values are only comparable within a fixed network and
+normalisation** — the smaller `net13Jun12` network from the 2017 paper puts the
+same samples near 0.916 rather than 0.966.
+
+```{r network}
+load(file.path(PROJECT, "data", "ppi", "net17Jan16.rda"))   # -> net17Jan16.m
+net <- net17Jan16.m
+cat(sprintf("PPI network: %d nodes, %d edges\n", nrow(net), sum(net) / 2))
+```
+
+# Method implementation
+
+`DoIntegPPI` intersects the expression matrix with the network and keeps the
+maximally connected component; `CompSRana` computes SR per sample. If the SCENT
+package is not installed, the fallback below implements the identical formulas.
+It uses the closed form (exact for a binary adjacency matrix)
+
+$$S_i = \log s_i - \frac{\bigl(A\,(x \odot \log x)\bigr)_i}{s_i}$$
+
+which avoids ever allocating the dense $n \times n$ stochastic matrix.
+
+```{r sr-functions}
+integ_ppi <- function(exp.m, ppiA.m) {
+  common <- intersect(rownames(ppiA.m), rownames(exp.m))
+  stopifnot(length(common) >= 5000)
+  adj <- ppiA.m[common, common]
+  cl  <- igraph::components(igraph::graph_from_adjacency_matrix(
+           adj, mode = "undirected"))
+  mc  <- which(cl$membership == which.max(cl$csize))
+  adj <- adj[mc, mc]
+  list(expMC = exp.m[rownames(adj), ], adjMC = adj)
+}
+
+comp_max_sr <- function(adj.m) {
+  fa <- function(x, extra = NULL) as.vector(adj.m %*% x)
+  ap <- igraph::arpack(fa, options = list(n = nrow(adj.m), nev = 1, which = "LM"),
+                       sym = TRUE)
+  log(ap$values)
+}
+
+comp_sr <- function(integ.l) {
+  A <- Matrix::Matrix(integ.l$adjMC, sparse = TRUE)
+  maxSR <- comp_max_sr(integ.l$adjMC)
+  sr <- apply(integ.l$expMC, 2, function(x) {
+    s  <- as.vector(A %*% x)
+    S  <- log(s) - as.vector(A %*% (x * log(x))) / s   # local entropies
+    pi <- x * s; pi <- pi / sum(pi)                    # stationary distribution
+    sum(pi * S) / maxSR
+  })
+  list(SR = sr, maxSR = maxSR)
+}
+```
+
+`score_cohort()` runs the whole per-cohort pipeline: subset, gene filter
+(>= 10 counts in >= half that cohort's libraries), blind `DESeq2::vst`, Ensembl to
+Entrez mapping (most highly expressed gene wins where several map to one Entrez
+ID), network integration, and SR.
+
+```{r score-function}
+score_cohort <- function(cohort) {
+  message("=== ", cohort, " ===")
+  smp <- coldata[coldata$cohort == cohort, ]
+  smp <- smp[order(smp$Donor, as.integer(sub("D", "", smp$Time)), smp$Condition), ]
+  cts <- counts_all[, rownames(smp)]
+  smp$Donor <- factor(make.names(smp$Donor))     # DESeq2 dislikes spaces
+
+  keep <- rowSums(cts >= 10) >= floor(0.5 * ncol(cts))
+  message(sprintf("  %d libraries, %d donors, kept %d / %d genes",
+                  ncol(cts), dplyr::n_distinct(smp$Donor), sum(keep), length(keep)))
+
+  dds  <- DESeqDataSetFromMatrix(round(as.matrix(cts[keep, ])),
+                                 colData = smp, design = ~ Donor)
+  expr <- assay(vst(dds, blind = TRUE))
+  stopifnot(min(expr) > 0)                       # SR needs strictly positive input
+
+  ez   <- AnnotationDbi::mapIds(org.Hs.eg.db, keys = rownames(expr),
+                                keytype = "ENSEMBL", column = "ENTREZID",
+                                multiVals = "first")
+  expr <- expr[!is.na(ez), ]; ez <- ez[!is.na(ez)]
+  ord  <- order(rowMeans(expr), decreasing = TRUE)
+  expr <- expr[ord, ]; ez <- ez[ord]
+  dup  <- duplicated(ez)
+  expr <- expr[!dup, ]; rownames(expr) <- ez[!dup]
+
+  if (requireNamespace("SCENT", quietly = TRUE)) {
+    integ <- SCENT::DoIntegPPI(exp.m = expr, ppiA.m = net)
+    sr    <- SCENT::CompSRana(integ, local = FALSE, mc.cores = 1)$SR
+    names(sr) <- colnames(integ$expMC)   # CompSRana returns an unnamed vector
+    maxsr <- comp_max_sr(integ$adjMC)
+  } else {
+    integ <- integ_ppi(expr, net)
+    res   <- comp_sr(integ)
+    sr    <- res$SR; maxsr <- res$maxSR
+  }
+
+  smp$SR   <- as.numeric(sr[rownames(smp)])
+  smp$day  <- as.integer(sub("D", "", smp$Time))
+  smp$Time <- factor(smp$Time, levels = TORDER)
+  message(sprintf("  subnetwork %d genes, maxSR = %.4f, SR %.5f - %.5f",
+                  nrow(integ$adjMC), maxsr, min(smp$SR), max(smp$SR)))
+
+  list(cohort = cohort, smp = smp, n_genes = nrow(integ$adjMC),
+       n_edges = sum(integ$adjMC) / 2, maxSR = maxsr, n_kept = sum(keep))
+}
+```
+
+Reporting helpers, so each cohort section is a single call.
+
+```{r report-functions}
+# Reference values from the equivalent Python implementation on the same inputs.
+EXPECTED <- list(
+  fetal = list(genes = 8361, maxSR = 6.9282, mean = 0.96622, lo = 0.96518, hi = 0.96747),
+  adult = list(genes = 8511, maxSR = 6.9309, mean = 0.96571, lo = 0.96480, hi = 0.96664)
+)
+
+check_tbl <- function(res) {
+  e <- EXPECTED[[res$cohort]]
+  knitr::kable(data.frame(
+    quantity = c("genes in connected component", "maxSR", "mean SR", "min SR", "max SR"),
+    expected = c(e$genes, e$maxSR, e$mean, e$lo, e$hi),
+    observed = c(res$n_genes, res$maxSR, mean(res$smp$SR),
+                 min(res$smp$SR), max(res$smp$SR))
+  ), digits = 5,
+  caption = sprintf("%s cohort: observed versus reference values", res$cohort))
+}
+
+plot_traj <- function(res) {
+  ggplot(res$smp, aes(Time, SR, colour = Condition, group = Condition)) +
+    stat_summary(fun = mean, geom = "line", linewidth = 1.1) +
+    stat_summary(fun.data = mean_se, geom = "pointrange", size = 0.6) +
+    scale_colour_manual(values = PAL) +
+    labs(x = "day", y = "signalling entropy rate (SR)", colour = NULL,
+         title = sprintf("%s MSC potency across osteogenic differentiation",
+                         res$cohort),
+         subtitle = sprintf("%d libraries, %d donors, %d network genes",
+                            nrow(res$smp), dplyr::n_distinct(res$smp$Donor),
+                            res$n_genes)) +
+    theme_classic(base_size = 13)
+}
+
+plot_donors <- function(res) {
+  ggplot(res$smp, aes(day, SR, colour = Condition)) +
+    geom_point(size = 1.8) + geom_line(aes(group = Condition), alpha = 0.7) +
+    facet_wrap(~ Donor, nrow = 1) +
+    scale_colour_manual(values = PAL) +
+    labs(x = "day", y = "SR", colour = NULL) +
+    theme_bw(base_size = 12)
+}
+
+stats_for <- function(res) {
+  smp <- res$smp
+  trend <- lapply(c("OD", "CTRL"), function(arm) {
+    s  <- smp[smp$Condition %in% c(arm, "Base"), ]
+    ct <- cor.test(s$day, s$SR, method = "spearman", exact = FALSE)
+    data.frame(cohort = res$cohort, test = paste("SR vs day,", arm, "arm"),
+               n = nrow(s), statistic = unname(ct$estimate), p = ct$p.value)
+  }) %>% bind_rows()
+
+  w <- smp %>%
+    filter(Condition %in% c("OD", "CTRL")) %>%
+    select(Donor, Time, Condition, SR) %>%
+    pivot_wider(names_from = Condition, values_from = SR) %>%
+    tidyr::drop_na()
+  wt <- wilcox.test(w$OD, w$CTRL, paired = TRUE)
+
+  bind_rows(trend,
+    data.frame(cohort = res$cohort, test = "OD vs CTRL (paired, donor x day)",
+               n = nrow(w), statistic = unname(wt$statistic), p = wt$p.value))
+}
+```
+
+# Run both cohorts
+
+Fetal first, then adult. Each pass is fully independent of the other.
+
+```{r run, results='hold'}
+fits <- lapply(COHORTS, score_cohort)
+names(fits) <- COHORTS
+```
+
+```{r fetal-traj, fig.height=5}
+plot_traj(fits$fetal)
+ggsave(file.path(OUTDIR, "fig_fetal_sr_trajectory_R.png"), width = 8, height = 5, dpi = 200)
+ggsave(file.path(OUTDIR, "fig_fetal_sr_trajectory_R.pdf"), width = 8, height = 5)
+```
+
+```{r fetal-donors, fig.height=4.5}
+plot_donors(fits$fetal)
+```
+
+# Adult cohort
+
+```{r adult-check}
+check_tbl(fits$adult)
+```
+
+```{r adult-traj, fig.height=5}
+plot_traj(fits$adult)
+ggsave(file.path(OUTDIR, "fig_adult_sr_trajectory_R.png"), width = 8, height = 5, dpi = 200)
+ggsave(file.path(OUTDIR, "fig_adult_sr_trajectory_R.pdf"), width = 8, height = 5)
+```
+
+```{r adult-donors, fig.height=4.5}
+plot_donors(fits$adult)
+```
+
+# Combined output
+
+Per-sample SR for both cohorts in one table. The `cohort` column is not a factor
+you may test across — see the caveat above.
+
+```{r combine}
+sr_all <- bind_rows(lapply(fits, function(r)
+  r$smp[, c("cohort", "Donor", "Condition", "Time", "Stage", "day", "SR")]))
+write.csv(sr_all, file.path(OUTDIR, "scent_sr_both_cohorts_R.csv"))
+
+net_tbl <- bind_rows(lapply(fits, function(r) data.frame(
+  cohort = r$cohort, genes_kept = r$n_kept, network_genes = r$n_genes,
+  network_edges = r$n_edges, maxSR = r$maxSR,
+  mean_SR = mean(r$smp$SR), sd_SR = sd(r$smp$SR))))
+knitr::kable(net_tbl, digits = 5,
+             caption = "Per-cohort normalisation and network summary")
+```
+
+Free y-axes: the panels show the shape of each trajectory, not a difference in
+level between cohorts.
+
+```{r combined-fig, fig.height=5}
+ggplot(sr_all, aes(Time, SR, colour = Condition, group = Condition)) +
+  stat_summary(fun = mean, geom = "line", linewidth = 1.1) +
+  stat_summary(fun.data = mean_se, geom = "pointrange", size = 0.55) +
+  facet_wrap(~ cohort, scales = "free_y") +
+  scale_colour_manual(values = PAL) +
+  labs(x = "day", y = "signalling entropy rate (SR)", colour = NULL,
+       title = "SCENT potency estimate across osteogenic differentiation",
+       subtitle = "each cohort normalised independently; y-axes not comparable") +
+  theme_classic(base_size = 13)
+
+ggsave(file.path(OUTDIR, "fig_sr_trajectory_both_R.png"), width = 10, height = 5, dpi = 200)
+ggsave(file.path(OUTDIR, "fig_sr_trajectory_both_R.pdf"), width = 10, height = 5)
+```
+
+## Statistics
+
+Within-cohort tests only: SR versus time in each arm (the D0 baseline is shared and
+enters both), and osteogenic induction versus control paired within donor and day.
+
+```{r stats}
+stats_tbl <- bind_rows(lapply(fits, stats_for))
+knitr::kable(stats_tbl, digits = c(0, 0, 0, 3, 8),
+             caption = "Signalling entropy rate, within-cohort statistics")
+write.csv(stats_tbl, file.path(OUTDIR, "scent_sr_stats_both_R.csv"), row.names = FALSE)
+
+get_stat <- function(coh, pattern, what = "statistic")
+  stats_tbl[stats_tbl$cohort == coh & grepl(pattern, stats_tbl$test), what][1]
+```
+
+Reference values from the Python run: fetal OD $\rho = -0.82$
+($p = 1.1\times10^{-7}$), fetal CTRL $\rho = -0.94$ ($p = 8.1\times10^{-14}$),
+OD versus CTRL $p = 0.19$; adult OD $\rho = -0.79$ ($p = 2.4\times10^{-5}$),
+adult CTRL $\rho = -0.84$ ($p = 1.8\times10^{-6}$), OD versus CTRL $p = 0.47$.
+
+# Interpretation
+
+Both cohorts lose signalling entropy monotonically over the 17-day course — fetal
+$\rho$ = `r sprintf("%.2f", get_stat("fetal", "OD arm"))` and adult
+$\rho$ = `r sprintf("%.2f", get_stat("adult", "OD arm"))` in the induced arm —
+consistent with a progressive loss of differentiation potency as the network
+concentrates flux onto fewer signalling routes.
+
+The decline is, however, at least as steep in the non-induced control arm (fetal
+$\rho$ = `r sprintf("%.2f", get_stat("fetal", "CTRL arm"))`, adult
+$\rho$ = `r sprintf("%.2f", get_stat("adult", "CTRL arm"))`), and osteogenic
+induction adds no detectable further drop once donor and day are matched (fetal
+$p$ = `r sprintf("%.2f", get_stat("fetal", "OD vs CTRL", "p"))`, adult
+$p$ = `r sprintf("%.2f", get_stat("adult", "OD vs CTRL", "p"))`). On this dataset
+SR therefore tracks **time in culture — confluence, contact inhibition, replicative
+age — rather than osteogenic commitment specifically**. It should not be presented
+as a readout of the differentiation being induced without an experiment that
+separates culture duration from induction, for instance density-matched sampling or
+a second differentiation lineage as a comparator.
+
+Because the cohorts are confounded with sequencing batch and are normalised
+separately here, the fetal and adult SR values describe within-cohort dynamics only
+and are not contrasted with each other.
+
+# Session information
+
+```{r session}
+sessionInfo()
+```

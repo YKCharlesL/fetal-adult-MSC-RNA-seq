@@ -1,719 +1,1120 @@
 ---
-title: "Pairwise Enrichment"
-output: html_notebook
+title: "Pairwise enrichment: OD vs CTRL across osteogenic differentiation"
+subtitle: "Fetal (fMSC) and adult (aMSC) time courses, D1-D17"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+    code_folding: show
 ---
 
-# Setup Environment
-```{r setup, error = FALSE, warning = FALSE}
-#Load dependencies
-library(renv)
-library(ggplot2)
-library(org.Hs.eg.db)
-library(ComplexHeatmap)
-library(EnhancedVolcano)
-library(tidyverse)
-library(gdata)
-library(ashr)
-library(openxlsx)
-library(gprofiler2)
-library(circlize)
-library(egg)
-library(biomaRt)
-library(DESeq2)
-library(dplyr)
-library(here)
+<!--
+================================================================================
+ WHAT THIS NOTEBOOK DOES
+================================================================================
+ For each cohort (fMSC, aMSC) and each timepoint (D1, D2, D3, D4, D10, D17) it
+ contrasts osteogenic induction (OD) against the matched control (CTRL), then
+ summarises the result three ways: GO:BP enrichment heatmaps grouped into
+ biological themes, D4 volcano and pathway plots, and normalised counts for
+ individual genes of interest.
+
+ STRUCTURE
+   1  Setup            libraries, output helper
+   2  Helper functions all plotting / enrichment functions, defined once
+   3  Data             import, protein-coding filter
+   4  DESeq2           models and pairwise OD vs CTRL contrasts
+   5  GO enrichment    gprofiler2 per timepoint, grouped into themes
+   6  Figures 5-6      theme heatmaps across timepoints
+   7  Figure 7         D4 volcano, D4 pathway plots, D4 gene counts
+   8  Figure 8         signalling entropy and marker gene time courses
+   9  Session info
+
+ INPUTS   data/fMSC_norm_counts.csv, data/fMSC_meta.csv
+          data/aMSC_norm_counts.csv, data/aMSC_meta.csv
+ OUTPUTS  <OUTPUT_DIR>/*.xlsx, *.svg, *.png  and  <OUTPUT_DIR>/patent/*
+          (greyscale versions for print). OUTPUT_DIR is set in section 1.2.
+
+ CONVENTION  every figure has a colour version and a print-safe greyscale
+ version. Both come from the same function with greyscale = TRUE/FALSE, so the
+ two can never drift apart.
+================================================================================
+-->
+
+# 1 Setup
+
+## 1.1 Libraries
+
+Load order matters. Annotation and Bioconductor packages come first, and the
+tidyverse comes **last**, so that `dplyr::select`, `filter` and `rename` are not
+masked by `AnnotationDbi::select` or `biomaRt::select`. The original notebook
+achieved the same thing by calling `library(dplyr)` a second time at the end of
+the block; ordering makes the intent explicit instead.
+
+```{r setup, message = FALSE, warning = FALSE, error = FALSE}
+# --- project / environment -----------------------------------------------
+library(renv)          # project library management (activated via .Rprofile)
+library(here)          # paths relative to the project root
+
+# --- annotation and differential expression ------------------------------
+library(DESeq2)        # count modelling, lfcShrink
+library(ashr)          # shrinkage estimator used by lfcShrink(type = "ashr")
+library(org.Hs.eg.db)  # Ensembl -> symbol mapping
+library(biomaRt)       # gene biotype lookup (protein-coding filter)
+library(gprofiler2)    # GO / KEGG / Reactome / WikiPathways enrichment
+
+# --- plotting -------------------------------------------------------------
+library(ComplexHeatmap) # theme heatmaps
+library(circlize)       # colorRamp2 for heatmap colour scales
+library(EnhancedVolcano)# volcano plots
+library(egg)            # ggarrange for side-by-side panels
+library(svglite)        # vector output
+
+# --- data handling and export --------------------------------------------
+library(openxlsx)       # write.xlsx
+library(tidyverse)      # ggplot2, dplyr, tidyr, stringr - loaded LAST (see above)
+
+# plyr is used inside summarise_counts() via plyr::ddply and plyr::rename.
+# It is deliberately NOT attached: attaching plyr after dplyr masks
+# dplyr::rename / summarise and silently changes behaviour elsewhere.
+
+# Removed relative to the original setup chunk:
+#   library(ggplot2)  duplicate - part of tidyverse
+#   library(dplyr)    duplicate - part of tidyverse (masking handled by order)
+#   library(gdata)    no gdata function is called anywhere in this notebook
+#   library(stringr)  was re-loaded twice mid-notebook - part of tidyverse
+#   library(tidyr)    was re-loaded mid-notebook - part of tidyverse
+```
+
+## 1.2 Output helper
+
+Every figure is written through `exportplots()` so that size and destination are
+handled in one place. `y` is a path relative to `OUTPUT_DIR`, without extension;
+prefix it with `patent/` to route a greyscale version to the print folder. The
+helper creates the destination folder itself, because `svglite()` does not and
+fails with `cannot open stream ...` when it is missing.
+
+```{r export-helper}
+# Single place to change where figures go. Set it to "output", "output_clean2",
+# or anything else; nothing downstream needs editing.
+OUTPUT_DIR <- "output_clean2"
 
 exportplots <- function(x, y, w, h){
-  as.character(y)
-  png(filename = here::here("output", paste0(y, ".png")), width = w, height = h, units = "in", res = 600)
+  y <- as.character(y)
+  path <- here::here(OUTPUT_DIR, paste0(y, ".svg"))
+
+  # svglite() will NOT create missing folders - it fails with
+  #   "cannot open stream <path>"
+  # Create the target folder first so that a new OUTPUT_DIR, or a filename
+  # carrying a subfolder prefix such as "patent/...", just works.
+  dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
+
+  svglite(filename = path, width = w, height = h)
+  on.exit(dev.off(), add = TRUE)   # close the device even if print(x) errors,
+                                   # otherwise every later plot lands in the
+                                   # half-written SVG
   print(x)
-  dev.off()
+  invisible(path)
 }
+
+# Destinations used by name elsewhere in the notebook.
+dir.create(here::here(OUTPUT_DIR, "patent"), recursive = TRUE, showWarnings = FALSE)
 ```
 
-#Create heatmap plotting function for comparing GO terms across timepoints
-```{r}
-plot_2matrix_GSEA_hmap <- function(GeneList, Matrix, Matrix2, HmapTitle, FileName){
-  
-  #Generate blank matrix to hold values
-  GeneList_Matrix = data.frame(x1 = sort(GeneList),
-                               D1 = 1,
-                               D2 = 1,
-                               D3 = 1,
-                               D4 = 1,
-                               D10 = 1,
-                               D17 = 1)
-  
-  GeneList_Matrix2 = data.frame(x1 = sort(GeneList),
-                               D1 = 1,
-                               D2 = 1,
-                               D3 = 1,
-                               D4 = 1,
-                               D10 = 1,
-                               D17 = 1)
-  
-  #Map the pathways and their corresponding p values to the heatmap matrix
-  for(x in 1:length(Matrix)){
-    for(i in which(Matrix[[x]]$term_name %in% GeneList)){
-      GeneList_Matrix[which(GeneList_Matrix$x1 == Matrix[[x]]$term_name[i]), x+1] = Matrix[[x]][i,3]
+## 1.3 Shared constants
+
+```{r constants}
+# Timepoint ordering used for every factor and every plot axis.
+TIME_LEVELS <- c("D0", "D1", "D2", "D3", "D4", "D10", "D17")
+
+# Contrasts are OD vs CTRL at each timepoint except D0 (baseline, no OD arm).
+CONTRAST_DAYS <- c("D1", "D2", "D3", "D4", "D10", "D17")
+
+# Significance thresholds used throughout for calling a gene differential.
+LFC_CUT  <- 1     # |log2 fold change|
+PADJ_CUT <- 0.01  # adjusted p value
+
+# Column positions in a gprofiler2 gost() result, referred to by name below:
+#   3 = p_value, 9 = term_id, 11 = term_name
+```
+
+# 2 Helper functions
+
+All functions live here, defined exactly once. In the original notebook several
+of these were defined twice — once in colour and once in greyscale, and in two
+cases under the *same* name, so the second definition silently replaced the
+first. Each function below takes a `greyscale` argument instead.
+
+## 2.1 Theme heatmap across timepoints
+
+Builds a pathway (rows) by timepoint (columns) matrix of adjusted p values for
+two enrichment sets side by side — for example fMSC OD next to fMSC CTRL, or
+fMSC OD next to aMSC OD. Cells with no enrichment stay at 1 and pathways that
+are never enriched in either set are dropped.
+
+```{r fn-theme-heatmap}
+plot_theme_heatmap <- function(GeneList, Matrix, Matrix2, HmapTitle, FileName,
+                               greyscale = FALSE,
+                               block_labels = c("A", "B"),
+                               cell_h = 0.5,   # cm per pathway row
+                               body_w = 8){    # cm per block
+
+  # Blank matrix, one row per pathway and one column per timepoint.
+  # 1 = "not enriched", which is also the top of the colour scale.
+  blank <- data.frame(x1 = sort(GeneList),
+                      D1 = 1, D2 = 1, D3 = 1, D4 = 1, D10 = 1, D17 = 1)
+  GeneList_Matrix  <- blank
+  GeneList_Matrix2 <- blank
+
+  # Fill in the adjusted p value (gost result column 3) for every pathway that
+  # was enriched at that timepoint. x + 1 skips the pathway-name column.
+  for (x in 1:length(Matrix)) {
+    for (i in which(Matrix[[x]]$term_name %in% GeneList)) {
+      GeneList_Matrix[which(GeneList_Matrix$x1 == Matrix[[x]]$term_name[i]), x + 1] <-
+        Matrix[[x]][i, 3]
     }
   }
-  
-  for(x in 1:length(Matrix2)){
-    for(i in which(Matrix2[[x]]$term_name %in% GeneList)){
-      GeneList_Matrix2[which(GeneList_Matrix2$x1 == Matrix2[[x]]$term_name[i]), x+1] = Matrix2[[x]][i,3]
+  for (x in 1:length(Matrix2)) {
+    for (i in which(Matrix2[[x]]$term_name %in% GeneList)) {
+      GeneList_Matrix2[which(GeneList_Matrix2$x1 == Matrix2[[x]]$term_name[i]), x + 1] <-
+        Matrix2[[x]][i, 3]
     }
   }
-  
-  #concantenate the comparison matrix horizontally
-  all(GeneList_Matrix$x1 %in% GeneList_Matrix2$x1) #Do the GO IDs match between the 2 matrix, in the same order?
-  plot = cbind(GeneList_Matrix,GeneList_Matrix2[,-1])
-  
-  #Setup Matrix for heatmap
-  rownames(plot) = plot$x1
-  plot = plot[,-1]
-  plot = data.matrix(plot)
-  
-  #remove blanks
+
+  # Concatenate the two sets horizontally: block A then block B.
+  all(GeneList_Matrix$x1 %in% GeneList_Matrix2$x1)  # sanity check, same rows/order
+  plot <- cbind(GeneList_Matrix, GeneList_Matrix2[, -1])
+
+  # Pathway names become rownames; the rest becomes a numeric matrix.
+  rownames(plot) <- plot$x1
+  plot <- plot[, -1]
+  plot <- data.matrix(plot)
+
+  # Drop pathways that are at 1 everywhere (never enriched in either block).
   plot <- plot[rowSums(plot != 1) > 0, , drop = FALSE]
-  
-  #Plot Heatmap
-  col_hmap = colorRamp2(c(0,0.05, 1),c("red","pink", "white"))
-  Enrichment_Heatmap = Heatmap(plot,
-                  show_column_dend = FALSE,
-                   show_row_names = T,
-                   show_row_dend = TRUE,
-                   cluster_columns = FALSE,
-                  cluster_rows = TRUE,
-                  column_split = c(rep("A",6), rep("B",6)),
-                  column_gap = unit(5,"mm"),
-                   name = "Adjusted-P Value",
-                   column_title = HmapTitle,
-                   column_title_gp = gpar(fontsize = 25, fontface = "bold"),
-                  row_names_gp = gpar(fontsize = 10),
-                  col = col_hmap,
-                  width = unit(8, "cm"),
-                  height = unit(nrow(plot)*0.5, "cm"),
-                  heatmap_legend_param = list(
-                    at = c(0, 0.01, 0.02, 0.03,0.04,0.05)
-                  
-                  ))
-  Enrichment_Heatmap = draw(Enrichment_Heatmap, heatmap_legend_side = "left")
-  
+
+  n <- nrow(plot)
+  if (n == 0) {
+    message("plot_theme_heatmap: no enriched pathways for '", HmapTitle,
+            "' - nothing plotted.")
+    return(invisible(NULL))
+  }
+
+  # --- canvas sizing ------------------------------------------------------
+  # The heatmap body is nrow * cell_h tall, so a fixed 15 x 30 inch canvas
+  # leaves a one-row theme (immune) as a sliver in a sea of whitespace. Size
+  # the canvas from the content instead, with sane floors and ceilings.
+  rowname_cm <- max(nchar(rownames(plot))) * 0.17   # ~0.17 cm per char at fontsize 10
+  h_in <- min(max((n * cell_h + 5.5) / 2.54, 3), 40)
+  w_in <- min(max((2 * body_w + 0.5 + rowname_cm + 4) / 2.54, 6), 25)
+
+  # Shrink the title with the figure; 25pt on a 3-inch canvas overlaps the plot.
+  title_size <- max(10, min(25, round(h_in * 2.2)))
+
+  # Colour scale: significant -> dark, non-significant -> white.
+  col_hmap <- if (greyscale) {
+    colorRamp2(c(0, 0.05, 1), c("black", "gray70", "white"))
+  } else {
+    colorRamp2(c(0, 0.05, 1), c("red", "pink", "white"))
+  }
+
+  # cbind() made the second block's names unique (D1.1, D2.1, ...). Relabel so
+  # both blocks read D1..D17, and name the blocks themselves instead.
+  col_labels <- rep(CONTRAST_DAYS, 2)
+  col_split  <- factor(rep(block_labels, each = 6), levels = block_labels)
+
+  Enrichment_Heatmap <- Heatmap(
+    plot,
+    show_column_dend  = FALSE,
+    show_row_names    = TRUE,
+    show_row_dend     = n > 1,
+    cluster_columns   = FALSE,
+    cluster_rows      = n > 1,          # hclust needs at least two rows
+    column_labels     = col_labels,
+    column_split      = col_split,      # the two enrichment sets
+    column_gap        = unit(5, "mm"),
+    name              = "Adjusted-P Value",
+    column_title      = HmapTitle,
+    column_title_gp   = gpar(fontsize = title_size, fontface = "bold"),
+    row_names_gp      = gpar(fontsize = 10),
+    col               = col_hmap,
+    width             = unit(body_w, "cm"),
+    height            = unit(n * cell_h, "cm"),   # grows with pathway count
+    heatmap_legend_param = list(at = c(0, 0.01, 0.02, 0.03, 0.04, 0.05))
+  )
+  Enrichment_Heatmap <- draw(Enrichment_Heatmap, heatmap_legend_side = "left")
+
   exportplots(x = Enrichment_Heatmap,
-            y = FileName,
-            h = 30,
-            w = 15)
+              y = if (greyscale) paste0(FileName, "_greyscale") else FileName,
+              h = h_in, w = w_in)
+
+  invisible(c(pathways = n, height_in = h_in, width_in = w_in))
+}
+
+# Backwards-compatible names, in case other scripts call the old ones.
+plot_2matrix_GSEA_hmap <- function(...)
+  plot_theme_heatmap(..., greyscale = FALSE)
+plot_2matrix_GSEA_hmap_greyscale <- function(...)
+  plot_theme_heatmap(..., greyscale = TRUE)
+```
+
+## 2.2 GO enrichment per timepoint
+
+One call per timepoint, querying the genes that pass the fold-change and
+adjusted p thresholds in the requested direction: `"up"` = enriched in OD,
+`"down"` = enriched in CTRL. Timepoints that return nothing keep a `NULL` slot
+so the list stays aligned with `CONTRAST_DAYS`.
+
+```{r fn-gost}
+run_gost_pairwise <- function(res_list, direction = c("up", "down"),
+                              skip = integer(0), sources = "GO:BP"){
+  direction <- match.arg(direction)
+  out <- vector("list", length(res_list))
+
+  for (i in seq_along(res_list)) {
+    if (i %in% skip) next          # e.g. D1 CTRL, which has too few genes
+
+    res  <- res_list[[i]]
+    hits <- if (direction == "up") {
+      res$EnsemblID[res$log2FoldChange >  LFC_CUT & res$padj < PADJ_CUT]
+    } else {
+      res$EnsemblID[res$log2FoldChange < -LFC_CUT & res$padj < PADJ_CUT]
+    }
+
+    # tryCatch returns NULL on failure. Single-bracket assignment of a
+    # one-element list keeps the NULL slot instead of deleting it, which would
+    # shift every later timepoint by one.
+    out[i] <- list(tryCatch(
+      gost(query = hits,
+           organism = "hsapiens", ordered_query = FALSE,
+           multi_query = FALSE, significant = TRUE, exclude_iea = FALSE,
+           measure_underrepresentation = FALSE, evcodes = TRUE,
+           user_threshold = 0.05, correction_method = "g_SCS",
+           domain_scope = "annotated", custom_bg = NULL,
+           numeric_ns = "", as_short_link = FALSE, highlight = TRUE,
+           sources = sources)$result,
+      error = function(e) NULL))
+  }
+  out
 }
 ```
 
-#Load in Data + Meta
-```{r}
-# Load fetal MSC data
-f.counts <- read.csv(here("data", "fMSC_norm_counts.csv"), row.names = 1)
-f.meta   <- read.csv(here("data", "fMSC_meta.csv"), row.names = 1)
+## 2.3 Grouping GO terms into themes
 
-# Load adult MSC data
-a.counts <- read.csv(here("data", "aMSC_norm_counts.csv"), row.names = 1)
-a.meta   <- read.csv(here("data", "aMSC_meta.csv"), row.names = 1)
+Scans every enrichment table for term names matching a set of keywords and
+returns the unique pathway names per theme. These become the rows of the
+heatmaps in section 6.
 
-#Create data list and meta list to hold both fetal and adult data
-counts = list(f.counts, a.counts)
-names(counts) = c("fMSC","aMSC")
-
-meta = list(f.meta, a.meta)
-names(meta) = c("fMSC","aMSC")
-
-#Correct levels in meta file
-meta[[1]]$Time <- factor(meta[[1]]$Time, levels = c("D0", "D1", "D2", "D3", "D4", "D10", "D17"))
-meta[[2]]$Time <- factor(meta[[2]]$Time, levels = c("D0", "D1", "D2", "D3", "D4", "D10", "D17"))
-```
-
-#Filter for Protein Coding Genes
-```{r}
-mart <- useEnsembl(
-  biomart = "genes",
-  dataset = "hsapiens_gene_ensembl",
-  mirror = "useast"          # safer for publication
+```{r fn-themes}
+# Two keywords in the original patterns never matched anything, which is why
+# the immune theme collapsed to a single row:
+#   "defence"    - GO term names use American spelling. Of the 31 GO terms
+#                  QuickGO returns for "defence", none contain that string and
+#                  29 contain "defense". Fixed below.
+#   "homeotasis" - typo for "homeostasis". Fixed below. Low impact in practice,
+#                  because "process" in the same pattern matches almost every
+#                  GO:BP term anyway.
+# Both fixes only ADD rows to the heatmaps. If you need to reproduce a figure
+# made before this change, restore the two original spellings.
+THEME_PATTERNS <- list(
+  bone       = "bone|skele|collagen|matrix|osteo|oss",
+  diff       = "diff|genesis|genic",
+  immune     = "anti|immune|defense",
+  secretion  = "secret|exoc|vesicle",
+  metabolism = "homeostasis|metabolism|lysis|process|oxida|reduc"
 )
-coding.counts = list()
 
-for(i in 1:length(counts)){
+# Broader immune vocabulary. GO:BP splits immune biology across several word
+# stems that "immune" alone misses ("adaptive immunity", "inflammatory
+# response", "cytokine-mediated signaling pathway"). Swap this in if the immune
+# panel is still too sparse - it widens what counts as the immune theme, so say
+# so in the methods if you use it.
+IMMUNE_BROAD <- "anti|immun|defense|inflamm|cytokine|interleukin|chemokine|leukocyte"
+# THEME_PATTERNS$immune <- IMMUNE_BROAD
 
-  genes <- rownames(counts[[i]])
-  annot <- getBM(
-    attributes = c("ensembl_gene_id", "gene_biotype"),
-    filters = "ensembl_gene_id",
-    values = genes,
-    mart = mart
-    )
-  
-  # Keep protein-coding genes
-  protein_coding_genes <- annot$ensembl_gene_id[annot$gene_biotype == "protein_coding"]
-  coding.counts[[i]] <- counts[[i]][rownames(counts[[i]]) %in% protein_coding_genes, ]
+collect_theme_terms <- function(..., patterns = THEME_PATTERNS){
+  gsea_sets <- list(...)   # any number of enrichment lists, pooled together
+  lapply(patterns, function(p) {
+    terms <- character(0)
+    for (gsea in gsea_sets) {
+      for (tbl in gsea) {
+        if (is.null(tbl)) next
+        # column 11 = term_name
+        terms <- unique(c(terms, tbl[which(grepl(p, tbl$term_name)), 11]))
+      }
+    }
+    terms
+  })
 }
 ```
 
-#Create dds for pairwise comparisons at each time point between OD and CTRL
-```{r}
-#Time_labels = c("D0", "D1","D2","D3","D4","D10", "D17","D1","D2","D3","D4","D10", "D17")
-#Time_labels = factor(Time_labels, levels = c("D0", "D1", "D2", "D3", "D4", "D10", "D17"))
+## 2.4 Volcano plot
 
-pair = list()
+```{r fn-volcano}
+plot_de_volcano <- function(res, title = "DEGs at D4", greyscale = FALSE,
+                            n_label = 15, max_overlaps = 15){
 
-for(i in 1:length(counts)){
+  res <- data.frame(res)
+  res_reorder <- res[order(res$padj, decreasing = FALSE), ]   # most significant first
+
+  # Three-way colour key: up in OD, up in CTRL, not significant.
+  up   <- if (greyscale) "black"  else "red"
+  down <- if (greyscale) "gray50" else "blue"
+  ns   <- if (greyscale) "gray85" else "black"
+
+  keyvals.colour <- ifelse(
+    res$log2FoldChange < -LFC_CUT & res$padj < PADJ_CUT, down,
+    ifelse(res$log2FoldChange > LFC_CUT & res$padj < PADJ_CUT, up, ns))
+  keyvals.colour[is.na(keyvals.colour)] <- ns
+  names(keyvals.colour)[keyvals.colour == down] <- "CTRL"
+  names(keyvals.colour)[keyvals.colour == ns]   <- "N.S"
+  names(keyvals.colour)[keyvals.colour == up]   <- "OD"
+
+  EnhancedVolcano(res,
+                  x = "log2FoldChange", y = "padj",
+                  lab = res$Symbol,
+                  selectLab = res_reorder$Symbol[1:n_label],
+                  drawConnectors = TRUE, max.overlaps = max_overlaps,
+                  pCutoff = PADJ_CUT, FCcutoff = LFC_CUT,
+                  title = title,
+                  pointSize = 2.0, colAlpha = 1, colCustom = keyvals.colour,
+                  gridlines.major = FALSE, gridlines.minor = FALSE,
+                  xlab = "Log2 Fold Change", ylab = "-log10(padj)")
+}
+
+# How many genes pass threshold in each direction - printed next to each volcano.
+count_degs <- function(res){
+  res <- data.frame(res)
+  c(OD   = sum(res$log2FoldChange >  LFC_CUT & res$padj < PADJ_CUT, na.rm = TRUE),
+    CTRL = sum(res$log2FoldChange < -LFC_CUT & res$padj < PADJ_CUT, na.rm = TRUE))
+}
+```
+
+## 2.5 Pathway (Manhattan) plot
+
+`run_gost_pathways()` queries KEGG, Reactome and WikiPathways for the genes up
+in OD; `plot_gost_manhattan()` renders the plot with a numbered table of
+highlighted terms underneath.
+
+```{r fn-gost-manhattan}
+run_gost_pathways <- function(res){
+  res <- data.frame(res)
+  gost(query = res$EnsemblID[res$log2FoldChange > LFC_CUT & res$padj < PADJ_CUT],
+       ordered_query = FALSE, organism = "hsapiens", significant = TRUE,
+       user_threshold = 0.05, correction_method = "fdr", exclude_iea = FALSE,
+       sources = c("KEGG", "REAC", "WP"))
+}
+
+plot_gost_manhattan <- function(gostres, highlight_rows, greyscale = FALSE,
+                                width = 10, height = 10, filename = NULL){
+
+  p <- gostplot(gostres, capped = FALSE, interactive = FALSE)
+
+  if (greyscale) {
+    # One grey level per source. unique(gostres$result$source) confirms which
+    # sources are present - all of them must be mapped or the plot errors.
+    p <- p + scale_color_manual(values = c(KEGG = "black",
+                                           REAC = "gray50",
+                                           WP   = "gray80"))
+    # Wrap long pathway names so the table underneath does not truncate them.
+    gostres$result$term_name <- str_wrap(gostres$result$term_name, width = 40)
+  }
+
+  # Column 9 = term_id: which terms get numbered and tabulated.
+  publish_gostplot(p, highlight_terms = gostres$result[highlight_rows, 9],
+                   width = width, height = height, filename = filename)
+}
+```
+
+## 2.6 Normalised counts for single genes
+
+Three related plots, kept as separate functions because they answer different
+questions. In the original notebook the last two shared a name, so the
+mean +/- SD version was overwritten before it was ever called.
+
+| function | x axis | shows |
+|---|---|---|
+| `plot_gene_D4_counts()` | Condition, D4 only | one line per donor |
+| `plot_gene_timecourse_mean()` | all timepoints | group mean +/- SD |
+| `plot_gene_timecourse_donors()` | all timepoints | one line per donor and arm |
+
+All three put fetal and adult side by side on a shared y axis and locate the
+gene by symbol via the D4 result table.
+
+Note, carried over unchanged from the original: each panel adds
+`scale_y_log10()` and then `scale_y_continuous(limits = ...)`. ggplot keeps only
+the last y scale, so the axis is **linear**, not log, and knitting prints a
+"Scale for y is already present" message. Delete the `scale_y_log10()` line if a
+log axis was intended.
+
+```{r fn-gene-counts-helpers}
+# Group means and SDs. plyr is namespaced rather than attached so it cannot
+# mask dplyr::rename / dplyr::summarise later in the notebook.
+summarise_counts <- function(data, varname, groupnames){
+  summary_func <- function(x, col) c(mean = mean(x[[col]], na.rm = TRUE),
+                                     sd   = sd(x[[col]],   na.rm = TRUE))
+  data_sum <- plyr::ddply(data, groupnames, .fun = summary_func, varname)
+  plyr::rename(data_sum, c("mean" = varname))
+}
+
+# Ensembl ID of a gene symbol, taken from the D4 result table of that cohort.
+gene_id_for <- function(res_D4, Gene) rownames(res_D4)[which(res_D4$Symbol == Gene)]
+
+# Common y limit so the fetal and adult panels are directly comparable.
+shared_ylim <- function(f_counts, a_counts)
+  c(0, max(f_counts$count, a_counts$count * 1.1))
+```
+
+```{r fn-gene-D4}
+plot_gene_D4_counts <- function(Gene, greyscale = FALSE){
+
+  f.geneCounts <- plotCounts(f.d4.dds, gene = gene_id_for(f.pair.res[[4]], Gene),
+                             intgroup = c("Condition", "Donor"), returnData = TRUE)
+  a.geneCounts <- plotCounts(a.d4.dds, gene = gene_id_for(a.pair.res[[4]], Gene),
+                             intgroup = c("Condition", "Donor"), returnData = TRUE)
+  ylim <- shared_ylim(f.geneCounts, a.geneCounts)
+
+  panel <- function(df, label){
+    if (greyscale) {
+      # Donor encoded by point shape and line type instead of colour.
+      p <- ggplot(df, aes(x = Condition, y = count,
+                          shape = Donor, linetype = Donor, group = Donor)) +
+        geom_point(size = 2, color = "black") + geom_line(color = "black")
+    } else {
+      p <- ggplot(df, aes(x = Condition, y = count, colour = Donor, group = Donor)) +
+        geom_point(size = 2) + geom_line()
+    }
+    p + scale_y_log10() + theme_classic() +
+      ggtitle(paste(label, Gene)) + ylab("Normalized Counts") +
+      scale_y_continuous(limits = ylim) +
+      theme(legend.position = "bottom")
+  }
+
+  out <- ggarrange(panel(f.geneCounts, "Fetal"), panel(a.geneCounts, "Adult"), ncol = 2)
+  exportplots(x = out,
+              y = if (greyscale) paste0("patent/", Gene, "_greyscale") else Gene,
+              h = 4, w = 7)
+}
+```
+
+```{r fn-gene-timecourse-mean}
+plot_gene_timecourse_mean <- function(Gene, greyscale = FALSE){
+
+  f.geneCounts <- plotCounts(pair[[1]], gene = gene_id_for(f.pair.res[[4]], Gene),
+                             intgroup = c("Time", "Condition"), returnData = TRUE)
+  a.geneCounts <- plotCounts(pair[[2]], gene = gene_id_for(a.pair.res[[4]], Gene),
+                             intgroup = c("Time", "Condition"), returnData = TRUE)
+
+  f <- summarise_counts(f.geneCounts, varname = "count",
+                        groupnames = c("Time", "Condition"))
+  a <- summarise_counts(a.geneCounts, varname = "count",
+                        groupnames = c("Time", "Condition"))
+
+  ylim <- shared_ylim(f.geneCounts, a.geneCounts)
+  pd   <- position_dodge(0.5)   # separate OD and CTRL at each timepoint
+
+  panel <- function(df, label){
+    aes_base <- if (greyscale) {
+      aes(x = Time, y = count, shape = Condition, group = Condition)
+    } else {
+      aes(x = Time, y = count, color = Condition, group = Condition)
+    }
+    p <- ggplot(df, aes_base)
+    p <- if (greyscale) {
+      p + geom_point(position = pd, size = 4, color = "black") +
+        scale_shape_manual(values = c(16, 17))                 # circle, triangle
+    } else {
+      p + geom_point(position = pd, size = 4) +
+        scale_color_manual(values = c("lightblue", "magenta"))
+    }
+    p + scale_y_log10() + theme_classic() +
+      ggtitle(paste0(label, " ", Gene)) + ylab("Normalized Counts") +
+      scale_y_continuous(limits = ylim) +
+      theme(axis.text.x = element_text(size = 7),
+            axis.text.y = element_text(size = 7),
+            legend.position = "bottom") +
+      # Error bars are clipped to the panel so they cannot rescale the axis.
+      geom_errorbar(aes(ymax = pmin(count + sd, ylim[2]),
+                        ymin = pmax(count - sd, 0)),
+                    width = 0.2, color = "black", position = pd)
+  }
+
+  out <- ggarrange(panel(f, "Fetal"), panel(a, "Adult"), ncol = 2)
+  exportplots(x = out,
+              y = if (greyscale) paste0("patent/8_", Gene, "_greyscale") else Gene,
+              h = 4, w = 6)
+}
+```
+
+```{r fn-gene-timecourse-donors}
+plot_gene_timecourse_donors <- function(Gene, greyscale = TRUE){
+
+  f.geneCounts <- plotCounts(pair[[1]], gene = gene_id_for(f.pair.res[[4]], Gene),
+                             intgroup = c("Time", "Condition", "Donor"), returnData = TRUE)
+  a.geneCounts <- plotCounts(pair[[2]], gene = gene_id_for(a.pair.res[[4]], Gene),
+                             intgroup = c("Time", "Condition", "Donor"), returnData = TRUE)
+
+  ylim <- shared_ylim(f.geneCounts, a.geneCounts)
+  pd   <- position_dodge(0.5)
+
+  panel <- function(df, label){
+    # One trace per donor x condition; condition carried by shape and linetype.
+    ggplot(df, aes(x = Time, y = count, shape = Condition, linetype = Condition,
+                   group = interaction(Donor, Condition))) +
+      scale_y_log10() +
+      geom_point(position = pd, size = 3, color = "black") +
+      geom_line(position = pd, color = "black") +
+      theme_classic() +
+      ggtitle(paste0(label, " ", Gene)) + ylab("Normalized Counts") +
+      scale_shape_manual(values = c(16, 17)) +
+      scale_y_continuous(limits = ylim) +
+      theme(axis.text.x = element_text(size = 7),
+            axis.text.y = element_text(size = 7),
+            legend.position = "bottom")
+  }
+
+  out <- ggarrange(panel(f.geneCounts, "Fetal"), panel(a.geneCounts, "Adult"), ncol = 2)
+  exportplots(x = out, y = paste0(Gene, "_greyscale_alldonors"), h = 4, w = 6)
+}
+```
+
+```{r fn-gost dotplot}
+plot_gost_dotplot <- function(gostres, rows = NULL, n_top = 12,
+                              greyscale = FALSE,
+                              title     = NULL,
+                              wrap      = 45,
+                              cell_h    = 0.55){   # cm per pathway row
+
+  df <- gostres$result
+
+  # ---- which terms to show ------------------------------------------------
+  if (is.null(rows)) {
+    # Top n_top per source, by adjusted p value.
+    df <- do.call(rbind, lapply(split(df, df$source), function(d)
+      d[order(d$p_value), ][seq_len(min(n_top, nrow(d))), , drop = FALSE]))
+  } else {
+    df <- df[rows, , drop = FALSE]
+  }
+  df <- df[!is.na(df$term_name), , drop = FALSE]
+
+  if (!nrow(df)) {
+    message("plot_gost_dotplot: no terms to plot.")
+    return(invisible(NULL))
+  }
+
+  # ---- derived quantities -------------------------------------------------
+  # precision = intersection_size / query_size, i.e. the usual "gene ratio".
+  df$gene_ratio <- if ("precision" %in% names(df)) df$precision
+                   else df$intersection_size / df$query_size
+  df$neglog10p  <- -log10(df$p_value)
+  df$label      <- str_wrap(df$term_name, width = wrap)
+  df$source     <- factor(df$source, levels = c("KEGG", "REAC", "WP"))
+
+  # Order rows by gene ratio within each source facet. Making the factor
+  # levels follow the global ordering keeps facets internally sorted.
+  df <- df[order(df$source, df$gene_ratio), ]
+  df$label <- factor(df$label, levels = unique(df$label))
+
+  # ---- canvas sized to content -------------------------------------------
+  n_lines <- sum(vapply(strsplit(levels(df$label), "\n"), length, integer(1)))
+  h_in <- min(max((n_lines * cell_h + 4) / 2.54, 4), 40)
+  w_in <- min(max((wrap * 0.17 + 12) / 2.54, 7), 20)
+
+  col_scale <- if (greyscale) {
+    scale_colour_gradient(low = "grey80", high = "black",
+                          name = expression(-log[10]~italic(p)))
+  } else {
+    scale_colour_gradient(low = "pink", high = "red",
+                          name = expression(-log[10]~italic(p)))
+  }
+
+  p <- ggplot(df, aes(x = gene_ratio, y = label)) +
+    geom_point(aes(size = intersection_size, colour = neglog10p)) +
+    col_scale +
+    scale_size_continuous(range = c(2, 7), name = "Genes in term") +
+    facet_grid(rows = vars(source), scales = "free_y", space = "free_y") +
+    labs(title = title, x = "Gene ratio (intersection / query)", y = NULL) +
+    theme_bw(base_size = 11) +
+    theme(plot.title       = element_text(face = "bold", hjust = 0.5),
+          strip.background = element_rect(fill = if (greyscale) "grey90" else "grey95"),
+          strip.text       = element_text(face = "bold"),
+          panel.grid.minor = element_blank(),
+          axis.text.y      = element_text(size = 9),
+          legend.position  = "right")
+
+  attr(p, "size_in") <- c(h = h_in, w = w_in)   # so the caller can size output
+  p
+}
+```
+
+
+# 3 Data
+
+## 3.1 Import counts and metadata
+
+Both cohorts are held in parallel lists, `counts[[1]]`/`meta[[1]]` = fetal and
+`counts[[2]]`/`meta[[2]]` = adult, so every downstream loop runs over both.
+
+```{r load-data}
+# Fetal MSC
+f.counts <- read.csv(here("data", "fMSC_norm_counts.csv"), row.names = 1)
+f.meta   <- read.csv(here("data", "fMSC_meta.csv"),        row.names = 1)
+
+# Adult MSC
+a.counts <- read.csv(here("data", "aMSC_norm_counts.csv"), row.names = 1)
+a.meta   <- read.csv(here("data", "aMSC_meta.csv"),        row.names = 1)
+
+counts <- list(fMSC = f.counts, aMSC = a.counts)
+meta   <- list(fMSC = f.meta,   aMSC = a.meta)
+
+# Timepoints are ordinal, not alphabetical - D10 must not sort before D2.
+meta <- lapply(meta, function(m){
+  m$Time <- factor(m$Time, levels = TIME_LEVELS)
+  m
+})
+```
+
+## 3.2 Restrict to protein-coding genes
+
+Biotypes come from Ensembl via biomaRt. The mirror is pinned for reproducibility.
+
+```{r protein-coding}
+mart <- useEnsembl(biomart = "genes",
+                   dataset = "hsapiens_gene_ensembl",
+                   mirror  = "useast")   # pinned mirror, safer for publication
+
+coding.counts <- list()
+for (i in 1:length(counts)) {
+  annot <- getBM(attributes = c("ensembl_gene_id", "gene_biotype"),
+                 filters    = "ensembl_gene_id",
+                 values     = rownames(counts[[i]]),
+                 mart       = mart)
+
+  protein_coding_genes <- annot$ensembl_gene_id[annot$gene_biotype == "protein_coding"]
+  coding.counts[[i]]   <- counts[[i]][rownames(counts[[i]]) %in% protein_coding_genes, ]
+}
+names(coding.counts) <- names(counts)
+
+sapply(coding.counts, nrow)   # genes retained per cohort
+```
+
+# 4 Differential expression
+
+## 4.1 DESeq2 models
+
+One model per cohort. `group` combines timepoint and condition into a single
+factor (`D4OD`, `D4CTRL`, ...) so that any timepoint can be contrasted directly;
+`Donor` absorbs the paired design.
+
+```{r deseq-models}
+pair <- list()
+
+for (i in 1:length(counts)) {
+  # Keep only libraries present in both the count matrix and the metadata,
+  # in the same order.
   common_samples <- intersect(colnames(coding.counts[[i]]), rownames(meta[[i]]))
-  counts_mat <- coding.counts[[i]][ , common_samples]
+  counts_mat <- coding.counts[[i]][, common_samples]
   metadata   <- meta[[i]][common_samples, ]
-  
-  # Convert categorical columns to factors
-  metadata$Time      <- factor(metadata$Time, levels = c("D0", "D1","D2","D3","D4","D10","D17"))
+
+  metadata$Time      <- factor(metadata$Time, levels = TIME_LEVELS)
   metadata$Condition <- factor(metadata$Condition)
   metadata$Donor     <- factor(metadata$Donor)
-  
-  # Create DESeq dataset
+
+  # Built with design = ~ 1 so prefiltering happens before the real design.
   x <- DESeqDataSetFromMatrix(countData = round(counts_mat),
-                              colData = metadata,
-                              design = ~ 1)
-  
-  # Prefilter low counts
-  keep <- rowSums(counts(x) >= 10) >= 3
-  x <- x[keep,]
-  
-  # Construct group and design
-  x$group <- factor(paste0(x$Time, x$Condition))
+                              colData   = metadata,
+                              design    = ~ 1)
+
+  keep <- rowSums(counts(x) >= 10) >= 3     # 10+ counts in at least 3 libraries
+  x    <- x[keep, ]
+
+  x$group   <- factor(paste0(x$Time, x$Condition))
   design(x) <- ~ group + Donor
-  
-  # Run DESeq
-  x <- DESeq(x)
-  
-  # Save result
-  pair[[i]] <- x
+
+  pair[[i]] <- DESeq(x)
+}
+names(pair) <- names(counts)
+```
+
+## 4.2 Pairwise OD vs CTRL contrasts
+
+`lfcShrink(type = "ashr", lfcThreshold = 1)` tests against a fold-change
+threshold rather than against zero, so `padj` already accounts for effect size.
+
+```{r fn-contrasts}
+pairwise_OD_vs_CTRL <- function(dds, days = CONTRAST_DAYS){
+  res <- lapply(days, function(d)
+    lfcShrink(dds, contrast = c("group", paste0(d, "OD"), paste0(d, "CTRL")),
+              type = "ashr", lfcThreshold = LFC_CUT))
+  names(res) <- days
+
+  # Carry the identifiers as columns so downstream code never has to rely on
+  # column positions (the original used res[[i]][, 8] and [, 9]).
+  lapply(res, function(r){
+    r$EnsemblID <- rownames(r)
+    r$Symbol    <- mapIds(org.Hs.eg.db, keys = r$EnsemblID,
+                          keytype = "ENSEMBL", column = "SYMBOL")
+    r
+  })
 }
 ```
 
-#Fetal Pairwise Comparisons
-```{r}
-Time_labels = c("D0", "D1","D2","D3","D4","D10", "D17","D1","D2","D3","D4","D10", "D17")
-Time_labels = factor(Time_labels, levels = c("D0", "D1", "D2", "D3", "D4", "D10", "D17"))
+```{r contrasts-fetal}
+f.pair.res <- pairwise_OD_vs_CTRL(pair[[1]])
 
-f.pair.res = list()
-f.pair.res[[1]] <- lfcShrink(pair[[1]], contrast=c("group","D1OD","D1CTRL"), type = "ashr", lfcThreshold = 1)
-f.pair.res[[2]] <- lfcShrink(pair[[1]], contrast=c("group","D2OD","D2CTRL"), type = "ashr", lfcThreshold = 1)
-f.pair.res[[3]] <- lfcShrink(pair[[1]], contrast=c("group","D3OD","D3CTRL"), type = "ashr", lfcThreshold = 1)
-f.pair.res[[4]] <- lfcShrink(pair[[1]], contrast=c("group","D4OD","D4CTRL"), type = "ashr", lfcThreshold = 1)
-f.pair.res[[5]] <- lfcShrink(pair[[1]], contrast=c("group","D10OD","D10CTRL"), type = "ashr", lfcThreshold = 1)
-f.pair.res[[6]] <- lfcShrink(pair[[1]], contrast=c("group","D17OD","D17CTRL"), type = "ashr", lfcThreshold = 1)
-names(f.pair.res) = levels(Time_labels)[-1]
-
-for(i in 1:length(f.pair.res)){ #Add EnsemblID and Symbol names
-  f.pair.res[[i]]$EnsemblID = rownames(f.pair.res[[i]])
-  f.pair.res[[i]]$Symbol = mapIds(org.Hs.eg.db, keys = f.pair.res[[i]]$EnsemblID, keytype = "ENSEMBL", column = "SYMBOL")
-}
-
-write.xlsx(f.pair.res,
-           here("output", "Fetal Pairwise Comparisons.xlsx"), 
-           colNames = TRUE, 
-           rownames = TRUE)
+# The original passed rownames = TRUE, which openxlsx ignores (the argument is
+# rowNames), so no row-name column was ever written. Kept that way on purpose -
+# the identifiers are already in the EnsemblID column.
+write.xlsx(f.pair.res, here(OUTPUT_DIR, "Fetal Pairwise Comparisons.xlsx"),
+           colNames = TRUE, rowNames = FALSE)
 ```
 
-#GO Enrichment of each timepoint fMSC
-```{r}
-#Fetal OD
-f.pair.gsea = list()
-for(i in 1:length(f.pair.res)){
-   x = gost(query = f.pair.res[[i]][f.pair.res[[i]]$log2FoldChange > 1 & f.pair.res[[i]]$padj < 0.01,8],
-                organism = "hsapiens", ordered_query = FALSE, 
-                multi_query = FALSE, significant = TRUE, exclude_iea = FALSE, 
-                measure_underrepresentation = FALSE, evcodes = TRUE, 
-                user_threshold = 0.05, correction_method = "g_SCS", 
-                domain_scope = "annotated", custom_bg = NULL, 
-                numeric_ns = "", as_short_link = FALSE, highlight = TRUE,
-                sources = "GO:BP")
-   f.pair.gsea[[i]] = x$result
-   
-   if(!is.null(x)){
-   }
-}
+```{r contrasts-adult}
+a.pair.res <- pairwise_OD_vs_CTRL(pair[[2]])
 
-gsea_OD_labels = c("D1_OD_GO","D2_OD_GO","D3_OD_GO","D4_OD_GO","D10_OD_GO", "D17_OD_GO")
-names(f.pair.gsea) = gsea_OD_labels
-write.xlsx(f.pair.gsea, here("output", "Fetal Pairwise OD GO.xlsx"), colNames = TRUE, rownames = TRUE)
-
-#Fetal CTRL
-f.pair.gsea.CTRL = list()
-for(i in 2:length(f.pair.res)){
-  tryCatch({
-    x = gost(query = f.pair.res[[i]][f.pair.res[[i]]$log2FoldChange < -1 & f.pair.res[[i]]$padj < 0.01,8],
-                organism = "hsapiens", ordered_query = FALSE, 
-                multi_query = FALSE, significant = TRUE, exclude_iea = FALSE, 
-                measure_underrepresentation = FALSE, evcodes = TRUE, 
-                user_threshold = 0.05, correction_method = "g_SCS", 
-                domain_scope = "annotated", custom_bg = NULL, 
-                numeric_ns = "", as_short_link = FALSE, highlight = TRUE,
-                sources = c("GO:BP"))
-  }, error = function(e){})
-   f.pair.gsea.CTRL[[i]] = x$result
-}
-
-gsea_CTRL_labels = c("D1_CTRL_GO","D2_CTRL_GO","D3_CTRL_GO","D4_CTRL_GO","D10_CTRL_GO", "D17_CTRL_GO")
-names(f.pair.gsea.CTRL) = gsea_CTRL_labels
-write.xlsx(f.pair.gsea.CTRL,
-           here("output", "Fetal Pairwise CTRL GO.xlsx"), 
-           colNames = TRUE, rownames = TRUE)
+# The original wrote this file without an extension ("Adult Pairwise DEGs").
+write.xlsx(a.pair.res, here(OUTPUT_DIR, "Adult Pairwise DEGs.xlsx"),
+           colNames = TRUE, rowNames = FALSE)
 ```
 
-#Filter GO terms for each themes
-```{r}
-#Filter for specific pathway themes: 
-bone = c()
-diff = c()
-immune = c()
-secretion = c()
-metabolism = c()
+# 5 GO enrichment
 
-#Fetal OD
-for(i in 1:length(f.pair.gsea)){
-  b  = f.pair.gsea[[i]][which(grepl("bone|skele|collagen|matrix|osteo|oss", f.pair.gsea[[i]]$term_name)), 11]
-  bone = c(bone, b)
-  bone = unique(bone)
+## 5.1 Per timepoint, per cohort
 
-  d  = f.pair.gsea[[i]][which(grepl("diff|genesis|genic", f.pair.gsea[[i]]$term_name)), 11]
-  diff = c(diff, d)
-  diff = unique(diff)
-  
-  im = f.pair.gsea[[i]][which(grepl("anti|immune|defence", f.pair.gsea[[i]]$term_name)), 11]
-  immune = c(immune, im)
-  immune = unique(immune)
-  
-  s  = f.pair.gsea[[i]][which(grepl("secret|exoc|vesicle", f.pair.gsea[[i]]$term_name)), 11]
-  secretion = c(secretion, s)
-  secretion = unique(secretion)
-  
-  m  = f.pair.gsea[[i]][which(grepl("homeotasis|metabolism|lysis|process|oxida|reduc", f.pair.gsea[[i]]$term_name)), 11]
-  metabolism = c(metabolism, m)
-  metabolism = unique(metabolism)
-}
+Genes up in OD and genes up in CTRL are queried separately against GO:BP. D1
+CTRL is skipped: too few genes pass the threshold for gost to return a result.
 
-#Fetal CTRL
-for(i in 1:length(f.pair.gsea.CTRL)){
-  b  = f.pair.gsea.CTRL[[i]][which(grepl("bone|skele|collagen|matrix|osteo|oss", f.pair.gsea.CTRL[[i]]$term_name)), 11]
-  bone = c(bone, b)
-  bone = unique(bone)
+```{r gost-fetal}
+f.pair.gsea      <- run_gost_pairwise(f.pair.res, direction = "up")
+f.pair.gsea.CTRL <- run_gost_pairwise(f.pair.res, direction = "down", skip = 1)
 
-  d  = f.pair.gsea.CTRL[[i]][which(grepl("diff|genesis|genic", f.pair.gsea.CTRL[[i]]$term_name)), 11]
-  diff = c(diff, d)
-  diff = unique(diff)
-  
-  im = f.pair.gsea.CTRL[[i]][which(grepl("anti|immune|defence", f.pair.gsea.CTRL[[i]]$term_name)), 11]
-  immune = c(immune, im)
-  immune = unique(immune)
-  
-  s  = f.pair.gsea.CTRL[[i]][which(grepl("secret|exoc|vesicle", f.pair.gsea.CTRL[[i]]$term_name)), 11]
-  secretion = c(secretion, s)
-  secretion = unique(secretion)
-  
-  m  = f.pair.gsea.CTRL[[i]][which(grepl("homeotasis|metabolism|lysis|process|oxida|reduc", f.pair.gsea.CTRL[[i]]$term_name)), 11]
-  metabolism = c(metabolism, m)
-  metabolism = unique(metabolism)
+names(f.pair.gsea)      <- paste0(CONTRAST_DAYS, "_OD_GO")
+names(f.pair.gsea.CTRL) <- paste0(CONTRAST_DAYS, "_CTRL_GO")
+
+write.xlsx(f.pair.gsea,      here(OUTPUT_DIR, "Fetal Pairwise OD GO.xlsx"),
+           colNames = TRUE, rowNames = FALSE)
+write.xlsx(f.pair.gsea.CTRL, here(OUTPUT_DIR, "Fetal Pairwise CTRL GO.xlsx"),
+           colNames = TRUE, rowNames = FALSE)
+```
+
+```{r gost-adult}
+a.pair.gsea      <- run_gost_pairwise(a.pair.res, direction = "up")
+a.pair.gsea.CTRL <- run_gost_pairwise(a.pair.res, direction = "down", skip = 1)
+
+names(a.pair.gsea)      <- paste0(CONTRAST_DAYS, "_OD_GO")
+names(a.pair.gsea.CTRL) <- paste0(CONTRAST_DAYS, "_CTRL_GO")
+
+write.xlsx(a.pair.gsea,      here(OUTPUT_DIR, "Adult Pairwise OD GO.xlsx"),
+           colNames = TRUE, rowNames = FALSE)
+write.xlsx(a.pair.gsea.CTRL, here(OUTPUT_DIR, "Adult Pairwise CTRL GO.xlsx"),
+           colNames = TRUE, rowNames = FALSE)
+```
+
+## 5.2 Group terms into themes
+
+Themes are defined from the **fetal** enrichments only (OD and CTRL pooled) and
+then reused for the adult heatmaps, so the same pathway rows appear in every
+panel.
+
+```{r themes}
+themes <- collect_theme_terms(f.pair.gsea, f.pair.gsea.CTRL)
+
+bone       <- themes$bone
+diff       <- themes$diff
+immune     <- themes$immune
+secretion  <- themes$secretion     # collected but not plotted below
+metabolism <- themes$metabolism
+
+sapply(themes, length)   # pathways per theme
+```
+
+# 6 Figures 5 and 6: theme heatmaps
+
+Each heatmap shows one theme, with block A on the left and block B on the right.
+Rows are pathways, columns are timepoints D1 to D17, and colour is the adjusted
+p value.
+
+## 6.1 fMSC OD vs fMSC CTRL (colour)
+
+```{r fig56-fetal-colour}
+# Theme label with an initial capital, e.g. "bone" -> "Bone".
+theme_label <- function(th) paste0(toupper(substring(th, 1, 1)), substring(th, 2))
+
+for (th in c("bone", "diff", "immune", "metabolism")) {
+  Th <- theme_label(th)
+  plot_theme_heatmap(
+    GeneList  = themes[[th]],
+    Matrix    = f.pair.gsea,        # block A: OD
+    Matrix2   = f.pair.gsea.CTRL,   # block B: CTRL
+    HmapTitle = paste0(Th, ": fMSC OD_CTRL"),
+    block_labels = c("fMSC OD", "fMSC CTRL"),
+    # filename typo "Enrichmnet" kept so existing figure references still match
+    FileName  = paste0("fMSC OD_CTRL ", Th, " Pairwise Enrichmnet"),
+    greyscale = FALSE)
 }
 ```
 
-#Plot Fetal GO timepoint heatmaps (fig 5&6)
-```{r}
-plot_2matrix_GSEA_hmap(GeneList = bone,
-               Matrix = f.pair.gsea,
-               Matrix2 = f.pair.gsea.CTRL,
-               HmapTitle = "Bone: fMSC OD_CTRL",
-               FileName = "fMSC OD_CTRL Bone Pairwise Enrichmnet")
+## 6.2 fMSC OD vs fMSC CTRL (greyscale, for print)
 
-
-plot_2matrix_GSEA_hmap(GeneList = diff,
-               Matrix = f.pair.gsea,
-               Matrix2 = f.pair.gsea.CTRL,
-               HmapTitle = "Diff: fMSC OD_CTRL",
-               FileName = "fMSC OD_CTRL Diff Pairwise Enrichmnet")
-
-
-plot_2matrix_GSEA_hmap(GeneList = immune,
-               Matrix = f.pair.gsea,
-               Matrix2 = f.pair.gsea.CTRL,
-               HmapTitle = "Immune: fMSC OD_CTRL",
-               FileName = "fMSC OD_CTRL Immune Pairwise Enrichmnet")
-
-plot_2matrix_GSEA_hmap(GeneList = metabolism,
-               Matrix = f.pair.gsea,
-               Matrix2 = f.pair.gsea.CTRL,
-               HmapTitle = "Metabolism: fMSC OD_CTRL",
-               FileName = "fMSC OD_CTRL Metabolism Pairwise Enrichmnet")
-```
-
-#Adult Pairwise DEGs
-```{r}
-a.pair.res = list()
-a.pair.res[[1]] <- lfcShrink(pair[[2]], contrast=c("group","D1OD","D1CTRL"), type = "ashr", lfcThreshold = 1)
-a.pair.res[[2]] <- lfcShrink(pair[[2]], contrast=c("group","D2OD","D2CTRL"), type = "ashr", lfcThreshold = 1)
-a.pair.res[[3]] <- lfcShrink(pair[[2]], contrast=c("group","D3OD","D3CTRL"), type = "ashr", lfcThreshold = 1)
-a.pair.res[[4]] <- lfcShrink(pair[[2]], contrast=c("group","D4OD","D4CTRL"), type = "ashr", lfcThreshold = 1)
-a.pair.res[[5]] <- lfcShrink(pair[[2]], contrast=c("group","D10OD","D10CTRL"), type = "ashr", lfcThreshold = 1)
-a.pair.res[[6]] <- lfcShrink(pair[[2]], contrast=c("group","D17OD","D17CTRL"), type = "ashr", lfcThreshold = 1)
-names(a.pair.res) = levels(Time_labels)[-1]
-
-for(i in 1:length(a.pair.res)){ #Add EnsemblID and Symbol names
-  a.pair.res[[i]]$EnsemblID = rownames(a.pair.res[[i]])
-  a.pair.res[[i]]$Symbol = mapIds(org.Hs.eg.db, keys = a.pair.res[[i]]$EnsemblID, keytype = "ENSEMBL", column = "SYMBOL")
+```{r fig56-fetal-greyscale}
+for (th in c("bone", "diff", "immune", "metabolism")) {
+  Th <- theme_label(th)
+  plot_theme_heatmap(
+    GeneList  = themes[[th]],
+    Matrix    = f.pair.gsea,
+    Matrix2   = f.pair.gsea.CTRL,
+    HmapTitle = paste0(Th, ": fMSC OD_CTRL"),
+    block_labels = c("fMSC OD", "fMSC CTRL"),
+    FileName  = paste0("patent/fMSC OD_CTRL ", Th, " Pairwise Enrichmnet"),
+    greyscale = TRUE)
 }
-
-write.xlsx(a.pair.res,
-           here("output", "Adult Pairwise DEGs"),
-           colNames = TRUE, 
-           rownames = TRUE)
 ```
 
-#GO Enrichment of each timepoint aMSC
-```{r}
-#Adult OD
-a.pair.gsea = list()
-for(i in 1:length(a.pair.res)){
-   x = gost(query = a.pair.res[[i]][a.pair.res[[i]]$log2FoldChange > 1 & a.pair.res[[i]]$padj < 0.01,8],
-                organism = "hsapiens", ordered_query = FALSE, 
-                multi_query = FALSE, significant = TRUE, exclude_iea = FALSE, 
-                measure_underrepresentation = FALSE, evcodes = TRUE, 
-                user_threshold = 0.05, correction_method = "g_SCS", 
-                domain_scope = "annotated", custom_bg = NULL, 
-                numeric_ns = "", as_short_link = FALSE, highlight = TRUE,
-                sources = "GO:BP")
-   a.pair.gsea[[i]] = x$result
-   
-   if(!is.null(x)){
-   }
+## 6.3 fMSC OD vs aMSC OD (colour)
+
+Same themes, but block B is now the adult OD enrichment: the comparison is
+fetal against adult rather than induced against control.
+
+Note: the original notebook produced this comparison in greyscale only, so no
+colour version of these four figures existed. This chunk adds it, using the
+same destination convention as 6.1 (colour to the output root, greyscale to
+`patent/`).
+
+```{r fig56-fetal-vs-adult-colour}
+for (th in c("bone", "diff", "immune", "metabolism")) {
+  Th <- theme_label(th)
+  plot_theme_heatmap(
+    GeneList  = themes[[th]],
+    Matrix    = f.pair.gsea,        # block A: fetal OD
+    Matrix2   = a.pair.gsea,        # block B: adult OD
+    HmapTitle = paste0(Th, ": fMSC OD, aMSC OD"),
+    block_labels = c("fMSC OD", "aMSC OD"),
+    FileName  = paste0("fMSC OD_aMSC OD ", Th, " Pairwise Enrichmnet"),
+    greyscale = FALSE)
 }
+```
 
-names(a.pair.gsea) = gsea_OD_labels
-write.xlsx(a.pair.gsea,
-           here("output", "Adult Pairwise OD GO.xlsx"),
-           colNames = TRUE, rownames = TRUE)
+## 6.4 fMSC OD vs aMSC OD (greyscale, for print)
 
-#Adult CTRL
-a.pair.gsea.CTRL = list()
-for(i in 2:length(a.pair.res)){
-  tryCatch({
-    x = gost(query = a.pair.res[[i]][a.pair.res[[i]]$log2FoldChange < -1 & a.pair.res[[i]]$padj < 0.01,8],
-                organism = "hsapiens", ordered_query = FALSE, 
-                multi_query = FALSE, significant = TRUE, exclude_iea = FALSE, 
-                measure_underrepresentation = FALSE, evcodes = TRUE, 
-                user_threshold = 0.05, correction_method = "g_SCS", 
-                domain_scope = "annotated", custom_bg = NULL, 
-                numeric_ns = "", as_short_link = FALSE, highlight = TRUE,
-                sources = c("GO:BP"))
-  }, error = function(e){})
-   a.pair.gsea.CTRL[[i]] = x$result
-
+```{r fig56-fetal-vs-adult-greyscale}
+for (th in c("bone", "diff", "immune", "metabolism")) {
+  Th <- theme_label(th)
+  plot_theme_heatmap(
+    GeneList  = themes[[th]],
+    Matrix    = f.pair.gsea,
+    Matrix2   = a.pair.gsea,
+    HmapTitle = paste0(Th, ": fMSC OD, aMSC OD"),
+    block_labels = c("fMSC OD", "aMSC OD"),
+    FileName  = paste0("patent/fMSC OD_aMSC OD ", Th, " Pairwise Enrichmnet"),
+    greyscale = TRUE)
 }
-
-names(a.pair.gsea.CTRL) = gsea_CTRL_labels
-write.xlsx(a.pair.gsea.CTRL,
-           here("output", "Adult Pairwise CTRL GO.xlsx"),
-           colNames = TRUE, rownames = TRUE)
 ```
 
-#Plot Fetal OD vs Adult GO GO timepoint heatmaps (fig 5&6)
-```{r}
-plot_2matrix_GSEA_hmap(GeneList = bone,
-               Matrix = f.pair.gsea,
-               Matrix2 = a.pair.gsea,
-               HmapTitle = "Bone: fMSC OD, aMSC OD",
-               FileName = "fMSC OD_aMSC OD Bone Pairwise Enrichmnet")
+# 7 Figure 7: D4, the critical timepoint
 
+D4 shows the largest OD vs CTRL separation, so it gets a closer look in both
+cohorts: which genes move (volcano), which pathways they belong to (Manhattan
+plot), and how a handful of individual genes behave per donor.
 
-plot_2matrix_GSEA_hmap(GeneList = diff,
-               Matrix = f.pair.gsea,
-               Matrix2 = a.pair.gsea,
-               HmapTitle = "Diff: fMSC OD, aMSC OD",
-               FileName = "fMSC OD_aMSC OD Diff Pairwise Enrichmnet")
+## 7.1 Fetal volcano (7a)
 
+```{r fig7a-volcano-fetal}
+count_degs(f.pair.res[[4]])   # expected: OD 692 genes, CTRL 410 genes
 
-plot_2matrix_GSEA_hmap(GeneList = immune,
-               Matrix = f.pair.gsea,
-               Matrix2 = a.pair.gsea,
-               HmapTitle = "Immune: fMSC OD, aMSC OD",
-               FileName = "fMSC OD_aMSC OD Immune Pairwise Enrichmnet")
-
-plot_2matrix_GSEA_hmap(GeneList = metabolism,
-               Matrix = f.pair.gsea,
-               Matrix2 = a.pair.gsea,
-               HmapTitle = "Metabolism: fMSC OD, aMSC OD",
-               FileName = "fMSC OD_aMSC OD Metabolism Pairwise Enrichmnet")
-```
-
-#Function to plot normalized counts of individual genes, using the gene symbol as a string
-```{r}
-plot_single_gene_counts <- function(Gene){
-  
-  #For Fetal
-  f.geneCounts <- plotCounts(f.d4.dds, 
-                         gene = rownames(f.pair.res[[4]])[which(f.pair.res[[4]][,9] == Gene)],
-                         intgroup = c("Condition","Donor"),
-                         returnData = TRUE,
-                         )
-  
-    a.geneCounts <- plotCounts(a.d4.dds, 
-                         gene = rownames(a.pair.res[[4]])[which(a.pair.res[[4]][,9] == Gene)],
-                         intgroup = c("Condition","Donor"),
-                         returnData = TRUE,
-                         )
-  
-  p1 <- ggplot(f.geneCounts, aes(x = Condition, y = count, colour = Donor, group = Donor)) + 
-  scale_y_log10() +
-  geom_point(size=2)+
-  geom_line()+
-  theme_classic()+
-  ggtitle(paste0("Fetal ",Gene,sep=" "))+
-  ylab("Normalized Counts")+
-  scale_y_continuous(limits = c(0, max(f.geneCounts$count, a.geneCounts$count*1.1)))+
-  theme(legend.position = "bottom")
-  
-  p2 <- ggplot(a.geneCounts, aes(x = Condition, y = count, colour = Donor, group = Donor)) + 
-  scale_y_log10() +
-  geom_point(size=2)+
-  geom_line()+
-  theme_classic()+
-  ggtitle(paste0("Adult ",Gene,sep=" "))+
-  ylab("Normalized Counts")+
-  scale_y_continuous(limits = c(0,max(f.geneCounts$count, a.geneCounts$count*1.1)))+
-  theme(legend.position = "bottom")
-  
-  exportplots(x = ggarrange(p1,p2, ncol = 2), y = paste0(Gene), h = 4, w=7)  
-  }
-```
-
-#There appears to be some genes that are differentially regulated between fetal and Adult at D4, we want to plot the counts of these genes to investigate further (7e-h)
-```{r}
-f.d4.dds = pair[[1]][, which(pair[[1]]$Time == "D4")] 
-a.d4.dds = pair[[2]][, which(pair[[2]]$Time == "D4")] 
-
-plot_single_gene_counts(Gene = "TXNIP")
-plot_single_gene_counts(Gene = "FKBP5")
-plot_single_gene_counts(Gene = "TRNP1")
-plot_single_gene_counts(Gene = "ZBTB16")
-```
-
-#We want to investigate D4 Od vs Ctrl as it appears to be a critical timepoint in differentiation (Fetal) (7a)
-```{r}
-resD4 <- data.frame(f.pair.res[[4]])
-resD4_reorder <- resD4[order(resD4$padj, decreasing = FALSE),]
-
-#Visualize Significant DEGs as a Volcano Plot
-keyvals.colour <- ifelse(
-  resD4$log2FoldChange < -1 & resD4$padj < 0.01, 'blue',
-      ifelse(resD4$log2FoldChange > 1 & resD4$padj < 0.01, 'red',
-        'black'))
-
-keyvals.colour[is.na(keyvals.colour)] <- 'black'
-names(keyvals.colour)[keyvals.colour == 'blue'] <- 'CTRL'
-names(keyvals.colour)[keyvals.colour == 'black'] <- 'N.S'
-names(keyvals.colour)[keyvals.colour == 'red'] <- 'OD'
-
-#how many significant upregulated genes in OD? 692 genes
-length(which(resD4$log2FoldChange > 1 & resD4$padj < 0.01))
-
-#how many significant upregulated genes in CTRL? 410 genes
-length(which(resD4$log2FoldChange < -1 & resD4$padj < 0.01))
-
-png(here("output", "D4 Fetal Volcano.png"), units = "in", width = 8, height = 8, res = 300)
-EnhancedVolcano(resD4, x = "log2FoldChange", y = "padj", lab = resD4$Symbol, drawConnectors = TRUE, selectLab = resD4_reorder[1:15,9], pCutoff = 0.01, FCcutoff = 1, title = "DEGs at D4", pointSize = 2.0, colAlpha = 1, colCustom = keyvals.colour, gridlines.major = FALSE, gridlines.minor = F, xlab = "Log2 Fold Change", ylab = "-log10(padj)")
+# Colour version
+png(here(OUTPUT_DIR, "D4 Fetal Volcano.png"), units = "in", width = 8, height = 8, res = 300)
+print(plot_de_volcano(f.pair.res[[4]], greyscale = FALSE))
 dev.off()
 
+# Greyscale version
+exportplots(x = plot_de_volcano(f.pair.res[[4]], greyscale = TRUE),
+            y = "patent/7_D4 Fetal Volcano greyscale", h = 8, w = 8)
 ```
 
-#Enrichment of D4 OD vs CTRL (Fetal, 7b)
-```{r}
-gostres <- gost(query = resD4[resD4$log2FoldChange > 1 & resD4$padj < 0.01,8],
-     ordered_query = FALSE,
-     organism = 'hsapiens',
-     significant = TRUE,
-     user_threshold = 0.05,
-     correction_method = "fdr",
-     exclude_iea = FALSE,
-     sources = c("KEGG","REAC","WP")
-     )
+## 7.2 Fetal pathway enrichment (7b)
 
-names(gostres)
+```{r fig7b-pathways-fetal}
+gostres_f <- run_gost_pathways(f.pair.res[[4]])
+saveRDS(gostres_f, here(OUTPUT_DIR, "D4ODvCTRL fMSC enrichment plot.rds"))
 
-saveRDS(gostres, "D4ODvCTRL fMSC enrichment plot.rds")
+unique(gostres_f$result$source)   # sources present, all must be mapped in greyscale
 
-gostplot(gostres, capped = TRUE, interactive = TRUE)
+# Row indices of the terms to number and tabulate under the plot.
+HIGHLIGHT_F <- c(2, 5, 8, 10, 21, 17, 37, 40, 41, 45, 49, 50, 58, 71, 78, 80, 81)
 
-p <- gostplot(gostres, capped = FALSE, interactive = FALSE)
+# Colour version, written straight to png by publish_gostplot
+plot_gost_manhattan(gostres_f, HIGHLIGHT_F, greyscale = FALSE,
+                    width = 10, height = 10,
+                    filename = here(OUTPUT_DIR, "D4 Fetal GO plot.png"))
 
-pp <- publish_gostplot(p, highlight_terms = gostres$result[c(2,5,8,10,21,17,37,40,41,45,49,50,58,71,78,80,81),9],
-                       width = 10, height = 10, filename = here('output','D4 Fetal GO plot.png'))
-
+# Greyscale version
+pp_f <- plot_gost_manhattan(gostres_f, HIGHLIGHT_F, greyscale = TRUE,
+                            width = 15, height = 10)
+exportplots(x = pp_f, y = "patent/7_D4 Fetal GO plot greyscale", h = 20, w = 15)
 ```
 
-#We want to investigate D4 Od vs Ctrl as it appears to be a critical timepoint in differentiation (Adult 7c)
-```{r}
-resD4 <- data.frame(a.pair.res[[4]])
-resD4_reorder <- resD4[order(resD4$padj, decreasing = FALSE),]
+## 7.3 Adult volcano (7c)
 
-#Visualize Significant DEGs as a Volcano Plot
-keyvals.colour <- ifelse(
-  resD4$log2FoldChange < -1 & resD4$padj < 0.01, 'blue',
-      ifelse(resD4$log2FoldChange > 1 & resD4$padj < 0.01, 'red',
-        'black'))
+`max_overlaps = Inf` because the adult labels collide otherwise.
 
-keyvals.colour[is.na(keyvals.colour)] <- 'black'
-names(keyvals.colour)[keyvals.colour == 'blue'] <- 'CTRL'
-names(keyvals.colour)[keyvals.colour == 'black'] <- 'N.S'
-names(keyvals.colour)[keyvals.colour == 'red'] <- 'OD'
+```{r fig7c-volcano-adult}
+count_degs(a.pair.res[[4]])   # expected: OD 481 genes, CTRL 615 genes
 
-#how many significant upregulated genes in OD? 481 genes
-length(which(resD4$log2FoldChange > 1 & resD4$padj < 0.01))
-
-#how many significant upregulated genes in CTRL? 615 genes
-length(which(resD4$log2FoldChange < -1 & resD4$padj < 0.01))
-
-png(here("output", "D4 Adult Volcano.png"), units = "in", width = 8, height = 8, res = 300)
-
-EnhancedVolcano(resD4, x = "log2FoldChange", y = "padj", lab = resD4$Symbol, drawConnectors = TRUE, selectLab = resD4_reorder[1:15,9], max.overlaps = Inf, pCutoff = 0.01, FCcutoff = 1, title = "DEGs at D4", pointSize = 2.0, colAlpha = 1, colCustom = keyvals.colour, gridlines.major = FALSE, gridlines.minor = F, xlab = "Log2 Fold Change", ylab = "-log10(padj)")
-
+png(here(OUTPUT_DIR, "D4 Adult Volcano.png"), units = "in", width = 8, height = 8, res = 300)
+print(plot_de_volcano(a.pair.res[[4]], greyscale = FALSE, max_overlaps = Inf))
 dev.off()
+
+exportplots(x = plot_de_volcano(a.pair.res[[4]], greyscale = TRUE, max_overlaps = Inf),
+            y = "patent/7_D4 Adult Volcano greyscale", h = 8, w = 8)
 ```
 
-#Enrichment of D4 OD vs CTRL (Adult 7d)
-```{r}
-gostres <- gost(query = resD4[resD4$log2FoldChange > 1 & resD4$padj < 0.01,8],
-     ordered_query = FALSE,
-     organism = 'hsapiens',
-     significant = TRUE,
-     user_threshold = 0.05,
-     correction_method = "fdr",
-     exclude_iea = FALSE,
-     sources = c("KEGG","REAC","WP")
-     )
+## 7.4 Adult pathway enrichment (7d)
 
-names(gostres)
+```{r fig7d-pathways-adult}
+gostres_a <- run_gost_pathways(a.pair.res[[4]])
+saveRDS(gostres_a, here(OUTPUT_DIR, "D4ODvCTRL aMSC enrichment plot.rds"))
 
-saveRDS(gostres, "D4ODvCTRL aMSC enrichment plot.rds")
+HIGHLIGHT_A <- c(4, 11, 14, 18, 24)
 
-gostplot(gostres, capped = TRUE, interactive = TRUE)
+plot_gost_manhattan(gostres_a, HIGHLIGHT_A, greyscale = FALSE,
+                    width = 10, height = 8,
+                    filename = here(OUTPUT_DIR, "D4 Adult GO plot.png"))
 
-p <- gostplot(gostres, capped = FALSE, interactive = FALSE)
-
-pp <- publish_gostplot(p, highlight_terms = gostres$result[c(4, 11, 14, 18 , 24),9],
-                       width = 10, height = 8, filename = here("output", "D4 Adult GO plot.png"))
+pp_a <- plot_gost_manhattan(gostres_a, HIGHLIGHT_A, greyscale = TRUE,
+                            width = 10, height = 8)
+exportplots(x = pp_a, y = "patent/7_D4 Adult GO plot greyscale", h = 16, w = 15)
 ```
 
-#Modify the single gene plotting function to use all timepoints instead of just d4
+#7.5 Pathway enrichemnt dotplot for Fetal and Adult
 ```{r}
-#Modify the single gene plotting function to use all timepoints instead of just d4
-plot_single_gene_counts <- function(Gene){
-  
-  data_summary <- function(data, varname, groupnames){
-    require(plyr)
-    summary_func <- function(x, col){
-     c(mean = mean(x[[col]], na.rm=TRUE),
-      sd = sd(x[[col]], na.rm=TRUE))
-    }
-  data_sum<-ddply(data, groupnames, .fun=summary_func,
-                  varname)
-  data_sum <- rename(data_sum, c("mean" = varname))
-      return(data_sum)
+# Reuses gostres_f / gostres_a and the HIGHLIGHT_* row vectors from 7.2 / 7.4.
+# rows = HIGHLIGHT_F reproduces exactly the terms numbered on the Manhattan
+# plot; rows = NULL instead takes the top n_top per source.
+go_dotplot_sets <- list(
+  list(res = gostres_f, rows = NULL, cohort = "Fetal"),
+  list(res = gostres_a, rows = NULL, cohort = "Adult")
+)
+
+for (set in go_dotplot_sets) {
+  for (grey in c(FALSE, TRUE)) {
+    p <- plot_gost_dotplot(set$res, rows = set$rows, greyscale = grey,
+                           title = paste0("D4 OD vs CTRL: ", set$cohort))
+    if (is.null(p)) next
+    sz   <- attr(p, "size_in")
+    stem <- paste0("D4 ", set$cohort, " GO dotplot")
+    exportplots(x = p,
+                y = if (grey) paste0("patent/", stem, " greyscale") else stem,
+                h = sz[["h"]], w = sz[["w"]])
   }
-  
-  #For Fetal
-  f.geneCounts <- plotCounts(pair[[1]], 
-                         gene = rownames(f.pair.res[[4]])[which(f.pair.res[[4]][,9] == Gene)],
-                         intgroup = c("Time","Condition"),
-                         returnData = TRUE,
-                         )
-  
-  f <- data_summary(f.geneCounts, varname="count", 
-                    groupnames=c("Time", "Condition"))
-  
-  a.geneCounts <- plotCounts(pair[[2]], 
-                         gene = rownames(a.pair.res[[4]])[which(a.pair.res[[4]][,9] == Gene)],
-                         intgroup = c("Time","Condition"),
-                         returnData = TRUE,
-                         )
-   
-  a <- data_summary(a.geneCounts, varname="count", 
-                    groupnames=c("Time", "Condition"))
-  
-  pd <- position_dodge(0.5) # move them .05 to the left and right
-
-  p1 <- ggplot(f, aes(x = Time, y = count, color = Condition, group = Condition)) + 
-  scale_y_log10() +
-  geom_point(position = pd, size=4)+
-  theme_classic()+
-  ggtitle(paste0("Fetal ",Gene,sep=""))+
-  ylab("Normalized Counts")+
-  scale_color_manual(values=c("lightblue", "magenta"))+
-  scale_y_continuous(limits = c(0, max(f.geneCounts$count, a.geneCounts$count*1.1)))+
-  theme(axis.text.x = element_text(size=7), axis.text.y = element_text(size=7))+
-  theme(legend.position = "bottom")+ 
-  geom_errorbar(aes(ymax = ifelse(count+sd > max(f.geneCounts$count, a.geneCounts$count*1.1), max(f.geneCounts$count, a.geneCounts$count*1.1), count+sd), ymin = ifelse(count-sd < 0, 0, count-sd)), 
-                width=0.2, color = "black", position=pd)
-
-  p2 <- ggplot(a, aes(x = Time, y = count, color = Condition, group = Condition)) + 
-  scale_y_log10() +
-  geom_point(position = pd, size=4)+
-  theme_classic()+
-  ggtitle(paste0("Adult ",Gene,sep=""))+
-  ylab("Normalized Counts")+
-  scale_color_manual(values=c("lightblue", "magenta"))+
-  scale_y_continuous(limits = c(0,max(f.geneCounts$count, a.geneCounts$count*1.1)))+
-  theme(axis.text.x = element_text(size=7), axis.text.y = element_text(size=7))+
-  theme(legend.position = "bottom")+
-  geom_errorbar(aes(ymax = ifelse(count+sd > max(f.geneCounts$count, a.geneCounts$count*1.1),max(f.geneCounts$count, a.geneCounts$count*1.1), count+sd), ymin = ifelse(count-sd < 0, 0, count-sd)), width=0.2, color = "black", position=pd)
-  
-  exportplots(x = ggarrange(p1,p2, ncol = 2), y = Gene, h = 4, w=6)  
 }
 ```
 
-#Plot stemness related genes
-```{r}
-plot_single_gene_counts(Gene = "KLF4")
-plot_single_gene_counts(Gene = "MYC")
-plot_single_gene_counts(Gene = "NOTCH1")
-plot_single_gene_counts(Gene = "DNMT1")
-plot_single_gene_counts(Gene = "TET2")
-plot_single_gene_counts(Gene = "LRP5")
-plot_single_gene_counts(Gene = "FGF2")
-plot_single_gene_counts(Gene = "PMF1-BGLAP")
-plot_single_gene_counts(Gene = "RUNX2")
-plot_single_gene_counts(Gene = "ALPL")
-plot_single_gene_counts(Gene = "COL1A1")
-plot_single_gene_counts(Gene = "CEBPA")
-plot_single_gene_counts(Gene = "PPARG")
-plot_single_gene_counts(Gene = "ACAN")
-plot_single_gene_counts(Gene = "COMP")
-plot_single_gene_counts(Gene = "SOX9")
-plot_single_gene_counts(Gene = "FKBP5")
-plot_single_gene_counts(Gene = "TRNP1")
-plot_single_gene_counts(Gene = "ZBTB16")
-plot_single_gene_counts(Gene = "TXNIP")
-plot_single_gene_counts(Gene = "ENG")
-plot_single_gene_counts(Gene = "NT5E")
-plot_single_gene_counts(Gene = "THY1")
-plot_single_gene_counts(Gene = "MME")
-plot_single_gene_counts(Gene = "FUT4")
-plot_single_gene_counts(Gene = "LEPR")
-plot_single_gene_counts(Gene = "FZD4")
-plot_single_gene_counts(Gene = "CD34")
-plot_single_gene_counts(Gene = "CD44")
-plot_single_gene_counts(Gene = "CD14")
-plot_single_gene_counts(Gene = "ITGB1")
-plot_single_gene_counts(Gene = "TFRC")
-plot_single_gene_counts(Gene = "SOX11")
-plot_single_gene_counts(Gene = "ANPEP")
-plot_single_gene_counts(Gene = "EBF1")
-plot_single_gene_counts(Gene = "CTNNB1")
-plot_single_gene_counts(Gene = "CBFA2T2")
-plot_single_gene_counts(Gene = "CTNNB1")
+
+## 7.5 Genes differing between fetal and adult at D4 (7e-h)
+
+`f.d4.dds` and `a.d4.dds` are the D4 slices used by `plot_gene_D4_counts()`.
+
+```{r fig7egh-gene-counts}
+f.d4.dds <- pair[[1]][, which(pair[[1]]$Time == "D4")]
+a.d4.dds <- pair[[2]][, which(pair[[2]]$Time == "D4")]
+
+for (g in c("TXNIP", "FKBP5", "TRNP1", "ZBTB16"))
+  plot_gene_D4_counts(Gene = g, greyscale = TRUE)
 ```
 
+# 8 Figure 8: entropy and marker gene time courses
 
-```{r}
+## 8.1 Signalling entropy rate (8a)
+
+`SR` is the signalling entropy rate carried in the fetal metadata: a
+network-based estimate of differentiation potency, which falls as cells commit.
+Two views — one trajectory per donor, and the group mean with SEM.
+
+```{r fig8a-entropy}
+f.meta$Time <- factor(f.meta$Time, levels = TIME_LEVELS)
+
+# Per-donor mean SR at each condition and timepoint
+donor_summary <- aggregate(SR ~ Donor + Condition + Time, data = f.meta,
+                           FUN = function(x) mean(x, na.rm = TRUE))
+colnames(donor_summary) <- c("Donor", "Condition", "Time", "mean_SR")
+
+# Group mean and standard error at each condition and timepoint
+mean_SR_df <- aggregate(SR ~ Condition + Time, data = f.meta,
+                        FUN = function(x) c(mean = mean(x, na.rm = TRUE),
+                                            sem  = sd(x, na.rm = TRUE) / sqrt(length(x))))
+mean_SR_df <- do.call(data.frame, mean_SR_df)   # unpack the matrix column
+colnames(mean_SR_df) <- c("Condition", "Time", "mean_SR", "sem_SR")
+
+# Per-donor trajectories, faceted by condition (greyscale)
+p_donor <- ggplot(donor_summary,
+                  aes(x = Time, y = mean_SR, group = Donor, color = Donor)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_grey(start = 0, end = 0.8) +
+  facet_wrap(~ Condition) +
+  labs(x = "Time (D)", y = "Mean entropy rate (per donor)") +
+  theme_classic(base_size = 14)
+
+p_donor   # shown inline only, not exported
+
+# Group mean with SEM error bars (greyscale) - this is the exported panel
+p_mean <- ggplot(mean_SR_df,
+                 aes(x = Time, y = mean_SR, color = Condition,
+                     shape = Condition, group = Condition)) +
+  geom_line(linewidth = 1.5) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = mean_SR - sem_SR, ymax = mean_SR + sem_SR), width = 0.15) +
+  scale_color_manual(values = c("black", "gray50")) +
+  theme_classic()
+
+exportplots(x = p_mean, y = "patent/8_fMSC_entropy", h = 4, w = 6)
+```
+
+## 8.2 Is the OD vs CTRL entropy difference significant?
+
+Paired t test within donor, at the two timepoints where the curves separate.
+`dplyr::select` is namespaced because several Bioconductor packages export a
+`select()` of their own.
+
+```{r fig8a-tests}
+sr_paired_test <- function(day){
+  wide <- subset(f.meta, Time == day) %>%
+    dplyr::select(Donor, Condition, SR) %>%
+    pivot_wider(names_from = Condition, values_from = SR)
+  t.test(wide$OD, wide$CTRL, paired = TRUE)
+}
+
+sr_paired_test("D3")
+sr_paired_test("D4")
+```
+
+## 8.3 Stemness genes
+
+```{r fig8-stemness}
+stemness_genes <- c("FGF2", "TET2", "MYC", "NOTCH1", "DNMT1", "LRP5", "KLF4")
+
+for (g in stemness_genes) plot_gene_timecourse_donors(Gene = g)
+```
+
+## 8.4 Osteogenic, lineage and surface marker genes
+
+Grouped by what each set is there to show. `CTNNB1` appeared twice in the
+original list; the duplicate is dropped.
+
+```{r fig8-markers}
+marker_genes <- list(
+  osteogenic      = c("PMF1-BGLAP", "RUNX2", "ALPL", "COL1A1"),
+  other_lineages  = c("CEBPA", "PPARG", "ACAN", "COMP", "SOX9"),
+  D4_responders   = c("FKBP5", "TRNP1", "ZBTB16", "TXNIP"),
+  MSC_surface     = c("ENG", "NT5E", "THY1", "MME", "FUT4", "LEPR", "FZD4",
+                      "CD34", "CD44", "CD14", "ITGB1", "TFRC", "ANPEP"),
+  transcription   = c("SOX11", "EBF1", "CTNNB1", "CBFA2T2")
+)
+
+for (g in unique(unlist(marker_genes))) plot_gene_timecourse_donors(Gene = g)
+```
+
+# 9 Session info
+
+```{r session-info}
 sessionInfo()
 ```
